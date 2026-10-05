@@ -7,3 +7,10 @@
 *passFile
 *venv
 *__pycache__
+
+# local build output and customer data
+dist/
+build/
+*.zip
+userInput*.yml
+!src/sampleUserInput.yml
