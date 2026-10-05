@@ -254,7 +254,7 @@ These come from upstream behavior and are **not** changed in v1.5:
 Requirements: Python **3.8 or 3.9** x64 (PyInstaller 4.5.1 does not support newer versions), [Win64 OpenSSL Light](https://slproweb.com/products/Win32OpenSSL.html) installed in `C:\Program Files\OpenSSL-Win64`, internet access for pip.
 
 ```
-git clone -b release/v1.5 https://github.com/<you>/NSX_V2T_Migration_Tool.git
+git clone -b release/v1.5 https://github.com/tylmz/NSX_V2T_Migration_Tool.git
 cd NSX_V2T_Migration_Tool
 build_windows.bat
 ```
