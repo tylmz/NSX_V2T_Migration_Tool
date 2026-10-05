@@ -3481,12 +3481,13 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
             vnicIpToTypeMap = {}
             for vnics in vNicsDetails:
                 if vnics['addressGroups']:
-                    if 'primaryAddress' in vnics['addressGroups']['addressGroup']:
-                        vnicIpToTypeMap[vnics['addressGroups']['addressGroup']['primaryAddress']] = vnics['type']
-                    if 'secondaryAddresses' in vnics['addressGroups']['addressGroup']:
-                        for ip in listify(
-                                vnics['addressGroups']['addressGroup']['secondaryAddresses']['ipAddress']):
-                            vnicIpToTypeMap[ip] = vnics['type']
+                    # PATCH-2: iterate every address group on the vNIC
+                    for addressGroup in listify(vnics['addressGroups']['addressGroup']):
+                        if 'primaryAddress' in addressGroup:
+                            vnicIpToTypeMap[addressGroup['primaryAddress']] = vnics['type']
+                        if addressGroup.get('secondaryAddresses'):
+                            for ip in listify(addressGroup['secondaryAddresses']['ipAddress']):
+                                vnicIpToTypeMap[ip] = vnics['type']
 
             extVirtualServerIP = list()
             for virtualServer in _virtualServersData:

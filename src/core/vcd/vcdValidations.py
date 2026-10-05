@@ -1678,6 +1678,13 @@ class VCDMigrationValidation:
 
                 if response.status_code == requests.codes.ok:
                     responseDict = response.json()
+                    # PATCH-4: an empty result means the -v2t network does not exist
+                    if not responseDict.get("values"):
+                        errorList.insert(0, "External network {} is used by edge Gateway - {}. Its subnets are not all present on "
+                                            "the target Tier-0/provider gateway, and the equivalent NSX-T segment backed external "
+                                            "network - {}-v2t is not present".format(
+                                                uplink['uplinkName'], edgeGateway['name'], uplink['uplinkName']))
+                        continue
                     extNet = responseDict.get("values")[0]
                     # Finding segment backed ext net for shared direct network
                     if [backing for backing in extNet['networkBackings']['values'] if
@@ -3936,12 +3943,13 @@ class VCDMigrationValidation:
         vnicIpToTypeMap = {}
         for vnics in vNicsDetails:
             if vnics['addressGroups']:
-                if 'primaryAddress' in vnics['addressGroups']['addressGroup']:
-                    vnicIpToTypeMap[vnics['addressGroups']['addressGroup']['primaryAddress']] = vnics['type']
-                if 'secondaryAddresses' in vnics['addressGroups']['addressGroup']:
-                    for ip in listify(
-                            vnics['addressGroups']['addressGroup']['secondaryAddresses']['ipAddress']):
-                        vnicIpToTypeMap[ip] = vnics['type']
+                # PATCH-2: iterate every address group on the vNIC
+                for addressGroup in listify(vnics['addressGroups']['addressGroup']):
+                    if 'primaryAddress' in addressGroup:
+                        vnicIpToTypeMap[addressGroup['primaryAddress']] = vnics['type']
+                    if addressGroup.get('secondaryAddresses'):
+                        for ip in listify(addressGroup['secondaryAddresses']['ipAddress']):
+                            vnicIpToTypeMap[ip] = vnics['type']
         for virtualServer in virtualServersData:
             if vnicIpToTypeMap.get(virtualServer['ipAddress']) == 'internal' and float(self.version) < float(vcdConstants.API_VERSION_BETELGEUSE_10_4):
                 return ["VIP from org VDC network is not supported on target side"]
@@ -3950,7 +3958,7 @@ class VCDMigrationValidation:
             if vnics.get('addressGroups') and vnics['type'] == 'internal':
                 for addressGroup in listify(vnics['addressGroups']['addressGroup']):
                     if addressGroup['primaryAddress'] in virtualSeverIp.values():
-                        errorList.add(vnics['addressGroups']['addressGroup']['primaryAddress'])
+                        errorList.add(addressGroup['primaryAddress'])  # PATCH-2
 
         sourceOrgVDCId = self.rollback.apiData['sourceOrgVDC']['@id']
         orgVdcNetworks = self.getOrgVDCNetworks(sourceOrgVDCId, 'sourceOrgVDCNetworks', saveResponse=False)
@@ -4214,10 +4222,16 @@ class VCDMigrationValidation:
                     for vnicData in vNicsDetails:
                         if "portgroupName" not in vnicData.keys():
                             continue
-                        primaryAddress = vnicData['addressGroups']['addressGroup']['primaryAddress']
-                        subnetMask = vnicData['addressGroups']['addressGroup']['subnetMask']
-                        if subnetMask and ipaddress.ip_address(nextHopIp) in ipaddress.ip_network(
-                            '{}/{}'.format(primaryAddress, subnetMask), strict=False):
+                        # PATCH-2: a vNIC can carry several subnets (address groups); check all of them
+                        nextHopOnVnic = False
+                        for addressGroup in listify((vnicData.get('addressGroups') or {}).get('addressGroup')):
+                            primaryAddress = (addressGroup or {}).get('primaryAddress')
+                            subnetMask = (addressGroup or {}).get('subnetMask')
+                            if primaryAddress and subnetMask and ipaddress.ip_address(nextHopIp) in ipaddress.ip_network(
+                                    '{}/{}'.format(primaryAddress, subnetMask), strict=False):
+                                nextHopOnVnic = True
+                                break
+                        if nextHopOnVnic:
                             # Checking next hop IP in internal Org VDC network
                             if vnicData["type"] == "internal":
                                 staticRoute['interface'] = None
@@ -7126,6 +7140,9 @@ class VCDMigrationValidation:
 
                         if targetExternalNetworkResponse.status_code == requests.codes.ok:
                             targetExternalNetworkResponseDict = targetExternalNetworkResponse.json()
+                            # PATCH-4: an empty result means the -v2t network does not exist
+                            if not targetExternalNetworkResponseDict.get("values"):
+                                return None, f"NSXT segment backed external network {parentNetworkId['name']+'-v2t'} is not present, and it is required for this direct shared network - {orgvdcNetwork}\n"
                             extNet = targetExternalNetworkResponseDict.get("values")[0]
                             # Finding segment backed ext net for shared direct network
                             if [backing for backing in extNet['networkBackings']['values'] if

@@ -64,7 +64,9 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         strict=False)
                     if networkAddress in [ipaddress.ip_network('{}/{}'.format(subnetData[0], subnetData[1]), strict=False)
                                           for subnetData in self.rollback.apiData['isT0Connected'].get(edgeGateway['name'], {}).get(extNet, [])]:
-                        edgeGatewaySubnetDict[extNet][networkAddress].extend(subnet['ipRanges']['values'])
+                        # PATCH-1: VCD returns null for an empty pool
+                        edgeGatewaySubnetDict[extNet][networkAddress].extend(
+                            (subnet.get('ipRanges') or {}).get('values') or [])
 
                     # TODO pranshu: multiple T0 - this can be removed.
                     #  Check self.rollback.apiData['sourceEdgeGateway'] in older versions
@@ -114,7 +116,25 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 for targetExtNetSubnet in targetExtNetData['subnets']['values']:
                     targetExtNetSubnetAddress = ipaddress.ip_network(
                         '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
-                    targetExtNetSubnet['ipRanges']['values'].extend(sourceEgwSubnets.get(targetExtNetSubnetAddress, []))
+                    # PATCH-1: tolerate a null pool; PATCH-1b: never add an IP that is already in the target pool
+                    if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):
+                        targetExtNetSubnet['ipRanges'] = {}
+                    existingRanges = targetExtNetSubnet['ipRanges'].get('values') or []
+                    existingIps = set()
+                    for existingRange in existingRanges:
+                        existingIps.update(range(int(ipaddress.ip_address(existingRange['startAddress'])),
+                                                 int(ipaddress.ip_address(existingRange['endAddress'])) + 1))
+                    for newRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
+                        for ipInt in range(int(ipaddress.ip_address(newRange['startAddress'])),
+                                           int(ipaddress.ip_address(newRange['endAddress'])) + 1):
+                            if ipInt not in existingIps:
+                                ipStr = str(ipaddress.ip_address(ipInt))
+                                existingRanges.append({'startAddress': ipStr, 'endAddress': ipStr})
+                                existingIps.add(ipInt)
+                            else:
+                                logger.debug("PATCH-1b: IP {} already in target external network pool, not added again".format(
+                                    ipaddress.ip_address(ipInt)))
+                    targetExtNetSubnet['ipRanges']['values'] = existingRanges
 
                 url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
                                        vcdConstants.ALL_EXTERNAL_NETWORKS, targetExtNetData['id'])
@@ -4591,7 +4611,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 response = self.getExternalNetworkByName(networkName)
                 # getting the external network sub allocated pools
                 for index, subnet in enumerate(response['subnets']['values']):
-                    externalRanges = subnet['ipRanges']['values']
+                    externalRanges = (subnet.get('ipRanges') or {}).get('values') or []  # PATCH-1
                     externalRangeList = []
                     externalNetworkSubnet = ipaddress.ip_network(
                         '{}/{}'.format(subnet['gateway'], subnet['prefixLength']),
@@ -4607,7 +4627,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                     # Raise exception if target ext network subnet has only one IP and EmptyPoolOverride flag is False
                     if subnet["totalIpCount"] == len(set(tuple(d.items()) for d in edgeGatewaySubnetDict[externalNetworkSubnet])):
                         if self.orgVdcInput.get("EmptyIPPoolOverride", False):
-                            logger.warning("Skipping removing '{}' IP from source external network - '{}'".format(externalRanges[0]["startAddress"], networkName))
+                            logger.warning("Skipping removing '{}' IP from source external network - '{}'".format(
+                                externalRanges[0]["startAddress"] if externalRanges else 'N/A', networkName))  # PATCH-1
                             continue
                         else:
                             raise Exception("External Network subnet should have atleast one free IP address which cannot be removed."
@@ -5200,7 +5221,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
 
                         # creating range of target external network pool range
                         targetExtNetIpRange = set()
-                        for externalRange in targetExtNetSubnet['ipRanges']['values']:
+                        for externalRange in (targetExtNetSubnet.get('ipRanges') or {}).get('values') or []:  # PATCH-1
                             targetExtNetIpRange.update(self.createIpRange(
                                 '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']),
                                 externalRange['startAddress'], externalRange['endAddress']
@@ -5219,6 +5240,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         targetExtNetIpRange = targetExtNetIpRange.difference(sourceEdgeGatewaySubIpRange)
 
                         # creating the range of each single ip in target external network's ips
+                        if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):  # PATCH-1
+                            targetExtNetSubnet['ipRanges'] = {}
                         targetExtNetSubnet['ipRanges']['values'] = self.createExternalNetworkSubPoolRangePayload(
                             targetExtNetIpRange)
 
