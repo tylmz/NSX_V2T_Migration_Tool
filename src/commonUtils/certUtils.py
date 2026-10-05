@@ -14,6 +14,7 @@ import subprocess
 
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
+from Crypto.Util.number import bytes_to_long, long_to_bytes
 
 
 def generateRSAKey():
@@ -38,7 +39,12 @@ def decryptSessionKey(privateKey, sessionKey):
         Returns     :   Decrypted secret key (STRING)
     """
     privateKey = RSA.importKey(privateKey.encode('utf-8'))
-    decryptedSecretKey = privateKey.decrypt(ast.literal_eval(sessionKey))
+    cipherText = ast.literal_eval(sessionKey)
+    if isinstance(cipherText, tuple):
+        cipherText = cipherText[0]
+    # PATCH-5: raw (unpadded) RSA decrypt, identical to legacy pycrypto _RSAobj.decrypt();
+    # works with both pycrypto and pycryptodome (which removed raw decrypt)
+    decryptedSecretKey = long_to_bytes(pow(bytes_to_long(cipherText), privateKey.d, privateKey.n))
     return decryptedSecretKey
 
 
@@ -50,7 +56,7 @@ def decryptCertPrivateKey(encPrivateKey, secret):
         Returns     :   Decrypted private key (STRING)
     """
     privateKey = base64.b64decode(encPrivateKey.encode('utf-8'))
-    cipher = AES.new(secret)
+    cipher = AES.new(secret, AES.MODE_ECB)  # PATCH-5: ECB was pycrypto's implicit default; pycryptodome requires it explicitly
     decryptedPrivateKey = str(cipher.decrypt(base64.b64decode(privateKey)), 'utf-8').rstrip('{')
     return decryptedPrivateKey
 
