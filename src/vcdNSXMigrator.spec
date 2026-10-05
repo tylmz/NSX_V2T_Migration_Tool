@@ -16,7 +16,7 @@ a = Analysis(
     ('./core/nsxt/template*', './src/core/nsxt'),
     ('./core/vcd/template*', './src/core/vcd')
   ],
-  hiddenimports=['pkg_resources.py2_warn', 'Crypto'],
+  hiddenimports=['Crypto', 'pkg_resources._vendor.packaging'],
   hookspath=[],
   runtime_hooks=[],
   excludes=[],
