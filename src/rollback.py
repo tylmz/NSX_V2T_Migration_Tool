@@ -46,6 +46,7 @@ class Rollback:
         self.preRollbackTasks = [
             'vcdObj.setStaticRoutesScope(rollback=True)',
             'vcdObj.disconnectTargetOrgVDCNetwork(rollback=True)',
+            'vcdObj.removeDmzStaticRoutes(nsxtObj)',  # PATCH-10
             'vcdObj.reconnectTargetEdgeGateway(reconnect=False)',
             'vcdObj.reconnectOrDisconnectSourceEdgeGateway(sourceEdgeGatewayId, connect=True)',
             'vcdObj.connectUplinkSourceEdgeGateway(sourceEdgeGatewayId, rollback=True)',

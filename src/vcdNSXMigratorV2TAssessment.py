@@ -109,6 +109,7 @@ VALIDATION_CLASSIFICATION = {
     'VM with Independent disks having different storage policies and fast provisioning enabled': 1,
     'No free interface on edge gateways': 1,
     'Published/Subscribed Catalog': 1,
+    'vApp lease expired or expiring soon': 1,  # PATCH-8
     'Shared Independent Disks': 2,
     'Cross VDC Networking': 2,
     **EDGE_GW_SERVICES_VALIDATIONS,
@@ -298,6 +299,7 @@ class VMwareCloudDirectorNSXMigratorV2T:
                 'No free interface on edge gateways': [self.vcdValidationObj.validateEdgeGatewayUplinks,
                                                      vdcId, self.edgeGatewayIdList, False],
                 'Published/Subscribed Catalog': [self.vcdValidationObj.getOrgVDCPublishedCatalogs, vdcId, orgName, True],
+                'vApp lease expired or expiring soon': [self.vcdValidationObj.validateVappLeases, vdcId, True],  # PATCH-8
                 'Shared Independent Disks': [self.vcdValidationObj.validateIndependentDisks, vdcId, OrgId, True],
                 'VM with Independent disks having different storage policies and fast provisioning enabled': [self.vcdValidationObj.validateNamedDiskWithFastProvisioned, vdcId],
                 'Validating Source Edge gateway services': [self.vcdValidationObj.getEdgeGatewayServices, None, None, None, True, True],

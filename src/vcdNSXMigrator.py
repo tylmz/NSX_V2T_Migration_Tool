@@ -7,6 +7,7 @@ Description: Module which is a run file that does the migration of VMware Cloud 
 """
 
 import argparse
+import ipaddress
 import colorlog
 import copy
 import getpass
@@ -334,6 +335,20 @@ class VMwareCloudDirectorNSXMigrator():
                             if sourceOrgVdc.get('LegacyDirectNetwork') and not isinstance(
                                     sourceOrgVdc.get('LegacyDirectNetwork'), bool):
                                 errorInputDict[dictKey] = "Value must be boolean i.e either True or False."
+                            # PATCH-10: optional CIDR lists
+                            for listKey in ('TransportSubnets', 'DmzStaticRoutes'):
+                                listValue = sourceOrgVdc.get(listKey)
+                                if listValue is None:
+                                    continue
+                                if not isinstance(listValue, list):
+                                    errorInputDict["{}['{}']".format(dictKey, listKey)] = "Value must be a list of CIDRs"
+                                    continue
+                                for cidr in listValue:
+                                    try:
+                                        ipaddress.ip_network(str(cidr).strip(), strict=False)
+                                    except ValueError:
+                                        errorInputDict["{}['{}']".format(dictKey, listKey)] = \
+                                            "Invalid CIDR '{}'".format(cidr)
 
         if not isinstance(self.inputDict['VCloudDirector'].get('SourceOrgVDC'), list):
             errorInputDict["VCloudDirector['SourceOrgVDC']"] = 'Value should be list'
