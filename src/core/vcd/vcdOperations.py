@@ -23,6 +23,7 @@ from collections import defaultdict
 from itertools import zip_longest
 from functools import reduce
 import src.core.vcd.vcdConstants as vcdConstants
+import src.core.nsxt.nsxtConstants as nsxtConstants
 from src.commonUtils.utils import listify, urn_id
 from src.core.vcd.vcdValidations import (
     isSessionExpired, description, remediate, remediate_threaded, getSession)
@@ -42,6 +43,136 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         vcdConstants.VCD_API_HEADER = vcdConstants.VCD_API_HEADER.format(self.version)
         vcdConstants.GENERAL_JSON_ACCEPT_HEADER = vcdConstants.GENERAL_JSON_ACCEPT_HEADER.format(self.version)
         vcdConstants.OPEN_API_CONTENT_TYPE = vcdConstants.OPEN_API_CONTENT_TYPE.format(self.version)
+
+    # PATCH-10: Tier-0 static routes for DMZ subnets ------------------------------------------------------
+    def _nsxtTier1LinkIp(self, nsxtObj, tier1Id):
+        """IP of the Tier-1 on its Tier-0 link (next hop for Tier-0 static routes)."""
+        realizedUrl = "{}/infra/realized-state/realized-entities?intent_path=/infra/tier-1s/{}".format(
+            nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), tier1Id)
+        response = nsxtObj.restClientObj.get(url=realizedUrl, headers=nsxtConstants.NSXT_API_HEADER,
+                                             auth=nsxtObj.restClientObj.auth)
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-10: failed to read realized state of Tier-1 {}: {}".format(tier1Id, response.text[:200]))
+        routerId = None
+        for entity in response.json().get('results', []):
+            if entity.get('entity_type') in ('RealizedLogicalRouter', 'RealizedLogicalRouterTier1'):
+                routerId = entity.get('realization_specific_identifier')
+                break
+        if not routerId:
+            raise Exception("PATCH-10: realized logical router of Tier-1 {} not found".format(tier1Id))
+        portsUrl = nsxtConstants.NSXT_HOST_API_URL.format(
+            nsxtObj.ipAddress, "api/v1/logical-router-ports?logical_router_id={}&resource_type=LogicalRouterLinkPortOnTIER1".format(routerId))
+        response = nsxtObj.restClientObj.get(url=portsUrl, headers=nsxtConstants.NSXT_API_HEADER,
+                                             auth=nsxtObj.restClientObj.auth)
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-10: failed to read router link port of Tier-1 {}: {}".format(tier1Id, response.text[:200]))
+        for port in response.json().get('results', []):
+            for subnet in port.get('subnets') or []:
+                for address in subnet.get('ip_addresses') or []:
+                    return address
+        raise Exception("PATCH-10: Tier-1 {} has no Tier-0 link address (is it connected to the Tier-0?)".format(tier1Id))
+
+    def _warnIfTier0DoesNotRedistributeStatic(self, nsxtObj, tier0Id):
+        url = "{}/infra/tier-0s/{}/locale-services".format(nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), tier0Id)
+        response = nsxtObj.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=nsxtObj.restClientObj.auth)
+        if response.status_code != requests.codes.ok:
+            return
+        for localeService in response.json().get('results', []):
+            for rule in ((localeService.get('route_redistribution_config') or {}).get('redistribution_rules') or []):
+                if 'TIER0_STATIC' in (rule.get('route_redistribution_types') or []):
+                    return
+        logger.warning("PATCH-10: Tier-0 {} does not redistribute static routes (TIER0_STATIC) - DMZ routes will not "
+                       "reach the upstream routers through BGP".format(tier0Id))
+
+    @description("creation of Tier-0 static routes for DMZ networks")
+    @remediate
+    def configureDmzStaticRoutes(self, nsxtObj):
+        """
+        PATCH-10: Opt-in through 'DmzStaticRoutes' (list of public CIDR blocks). For every routed Org VDC network
+        whose subnet lies in these blocks, a static route to the tenant Tier-1 is created on the provider Tier-0
+        (or VRF), so the subnet is reachable without the NSX-V transport link. Skipped for edges with
+        AdvertiseRoutedNetworks, which already advertise their networks. Removed again by rollback.
+        """
+        if not self.orgVdcInput.get('DmzStaticRoutes'):
+            return
+        data = self.rollback.apiData
+        sourceNetworks = self.getOrgVDCNetworks(data['sourceOrgVDC']['@id'], 'sourceOrgVDCNetworks', saveResponse=False)
+        created = data.get('dmzStaticRoutes') or []
+        for targetEdgeGateway in data.get('targetEdgeGateway', []):
+            edgeName = targetEdgeGateway['name']
+            edgeInput = self.orgVdcInput['EdgeGateways'].get(edgeName, {})
+            if edgeInput.get('AdvertiseRoutedNetworks'):
+                logger.info("PATCH-10: {} advertises routed networks, no DMZ static routes needed".format(edgeName))
+                continue
+            dmzNetworks = self.getDmzNetworks(edgeName, sourceNetworks)
+            if not dmzNetworks:
+                continue
+            externalNetwork = data['targetExternalNetwork'][edgeInput['Tier0Gateways']]
+            tier0Id = externalNetwork['networkBackings']['values'][0]['backingId']
+            # fresh edge gateway details for the NSX-T Tier-1 id
+            url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                                   targetEdgeGateway['id'])
+            response = self.restClientObj.get(url, {'Authorization': self.headers['Authorization'],
+                                                    'Accept': vcdConstants.OPEN_API_CONTENT_TYPE})
+            if response.status_code != requests.codes.ok:
+                raise Exception("PATCH-10: failed to read edge gateway {}".format(edgeName))
+            tier1Id = (response.json().get('gatewayBacking') or {}).get('backingId')
+            if not tier1Id:
+                raise Exception("PATCH-10: NSX-T backing of edge gateway {} not found".format(edgeName))
+            nextHop = self._nsxtTier1LinkIp(nsxtObj, tier1Id)
+            self._warnIfTier0DoesNotRedistributeStatic(nsxtObj, tier0Id)
+            edgeShortId = targetEdgeGateway['id'].split(':')[-1][:8]
+            for networkName, cidr in dmzNetworks:
+                routeId = "v2t-dmz-{}-{}".format(edgeShortId, cidr.replace('/', '_').replace('.', '-').replace(':', '-'))
+                if any(route['id'] == routeId and route['tier0'] == tier0Id for route in created):
+                    continue
+                routeUrl = "{}/infra/tier-0s/{}/static-routes/{}".format(
+                    nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), tier0Id, routeId)
+                payload = {
+                    "display_name": routeId,
+                    "description": "V2T DMZ route for {} ({}) - edge {}".format(networkName, cidr, edgeName),
+                    "network": cidr,
+                    "next_hops": [{"ip_address": nextHop, "admin_distance": 1}],
+                    "tags": [{"scope": "v2t-dmz", "tag": targetEdgeGateway['id']}]
+                }
+                response = nsxtObj.restClientObj.patch(url=routeUrl, headers=nsxtConstants.NSXT_API_HEADER,
+                                                       auth=nsxtObj.restClientObj.auth, data=json.dumps(payload))
+                if response.status_code not in (requests.codes.ok, requests.codes.created):
+                    raise Exception("PATCH-10: failed to create Tier-0 static route {} via {}: {}".format(
+                        cidr, nextHop, response.text[:200]))
+                created.append({'tier0': tier0Id, 'id': routeId, 'network': cidr, 'nextHop': nextHop})
+                data['dmzStaticRoutes'] = created
+                self.saveMetadataInOrgVdc(force=True)
+                logger.info("PATCH-10: Tier-0 {} static route {} -> {} created for DMZ network {}".format(
+                    tier0Id, cidr, nextHop, networkName))
+        logger.info("PATCH-10: remove the upstream routers' static routes for these DMZ subnets so the BGP routes are used")
+
+    def removeDmzStaticRoutes(self, nsxtObj):
+        """PATCH-10: rollback of configureDmzStaticRoutes."""
+        data = self.rollback.apiData
+        routes = data.get('dmzStaticRoutes') or []
+        if not routes:
+            return
+        logger.info("RollBack: Removing Tier-0 static routes created for DMZ networks")
+        remaining = []
+        for route in routes:
+            routeUrl = "{}/infra/tier-0s/{}/static-routes/{}".format(
+                nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), route['tier0'], route['id'])
+            response = nsxtObj.restClientObj.delete(url=routeUrl, headers=nsxtConstants.NSXT_API_HEADER,
+                                                    auth=nsxtObj.restClientObj.auth)
+            if response.status_code in (requests.codes.ok, requests.codes.not_found):
+                logger.debug("PATCH-10: removed Tier-0 static route {}".format(route['id']))
+            else:
+                remaining.append(route)
+                logger.error("PATCH-10: failed to remove Tier-0 static route {}: {}".format(route['id'], response.text[:200]))
+        data['dmzStaticRoutes'] = remaining
+        self.saveMetadataInOrgVdc(force=True)
+        if remaining:
+            raise Exception("PATCH-10: some DMZ static routes could not be removed: {}".format(
+                ', '.join(route['id'] for route in remaining)))
+        logger.info("RollBack: restore the upstream routers' static routes for the DMZ subnets towards the NSX-V edge")
+    # ------------------------------------------------------------------------------------------------------
+
 
     def _getEdgeGatewaySubnets(self):
         # getting details of ip ranges used in source edge gateways
@@ -239,10 +370,37 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 if sourceEdgeGatewayDict['name'] in data['isT0Connected']:
                     # Adding only those subnets to T0 subnet data that are going to be connected to external network via T0
                     gatewayList = [subnetData[0] for subnetData in data['isT0Connected'][sourceEdgeGatewayDict['name']][t0Gateway]]
+                    transportSubnet = (data.get('transportSubnets') or {}).get(sourceEdgeGatewayDict['name'])
                     for uplink in sourceEdgeGatewayDict['edgeGatewayUplinks']:
+                        if transportSubnet:
+                            # PATCH-10: take the uplink's non-transport subnets that are T0 connected
+                            subnetData += [copy.deepcopy(subnet) for subnet in uplink['subnets']['values']
+                                           if subnet['gateway'] in gatewayList and not
+                                           self.isTransportSubnet(sourceEdgeGatewayDict['name'], subnet['gateway'], subnet['prefixLength'])]
+                            continue
                         if uplink['subnets']['values'][0]['gateway'] in gatewayList:
                             subnetData += uplink['subnets']['values']
-                else:
+                    if transportSubnet and subnetData and not any(subnet.get('primaryIp') for subnet in subnetData):
+                        # PATCH-10: the primary IP was in the transport subnet; use the first allocated IP of the
+                        # first remaining subnet as primary
+                        for subnet in subnetData:
+                            ranges = (subnet.get('ipRanges') or {}).get('values') or []
+                            if ranges:
+                                subnet['primaryIp'] = ranges[0]['startAddress']
+                                break
+                if not subnetData and (data.get('transportSubnets') or {}).get(sourceEdgeGatewayDict['name']):
+                    # PATCH-10: only the transport subnet existed - connect the Tier-1 to the Tier-0 without uplink
+                    # IPs, using the placeholder subnet logic the tool already uses for edges not routed via T0
+                    freeSubnets = [subnet for subnet in externalDict['subnets']['values'] if
+                                   subnet['totalIpCount'] != subnet['usedIpCount']]
+                    if not freeSubnets:
+                        raise Exception("PATCH-10: edge gateway {} only had a transport subnet; the provider gateway {} "
+                                        "needs at least one subnet with a free IP to connect the Tier-1 without "
+                                        "uplink IPs".format(sourceEdgeGatewayDict['name'], externalDict['name']))
+                    subnetData = [copy.deepcopy(freeSubnets[0])]
+                    subnetData[0]['ipRanges'] = {'values': []}
+                    subnetData[0]['primaryIp'] = None
+                elif sourceEdgeGatewayDict['name'] not in data['isT0Connected']:
                     # In case target edge gateway is not going to be connected to T0, a dummy T0/VRF is necessary
                     # Adding first subnet from dummy T0 because payload demands atleast one subnet
                     subnetData = [subnet for subnet in externalDict['subnets']['values'] if
@@ -3479,6 +3637,9 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
 
             # setting static routes for NSX-T segment directly connected to target edge gateways
             self.setEdgeGatewayStaticRoutes()
+
+            # PATCH-10: Tier-0 static routes for DMZ networks (only with DmzStaticRoutes in the user input)
+            self.configureDmzStaticRoutes(nsxtObj)
 
             # update NAT rules in internal interfaces
             self.updateNATRules()

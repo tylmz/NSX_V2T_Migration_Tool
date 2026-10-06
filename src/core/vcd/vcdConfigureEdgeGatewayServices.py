@@ -666,7 +666,10 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                 sourceEdgeGatewayIps = []
                 for edgeGatewayUplink in sourceEdgeGateway['edgeGatewayUplinks']:
                     for subnet in edgeGatewayUplink["subnets"]["values"]:
-                        for range in subnet["ipRanges"]["values"]:
+                        # PATCH-10: no floating IPs for the transport subnet
+                        if self.isTransportSubnet(sourceEdgeGateway["name"], subnet.get("gateway"), subnet.get("prefixLength")):
+                            continue
+                        for range in (subnet.get("ipRanges") or {}).get("values") or []:
                             sourceEdgeGatewayIps.extend(self.returnIpListFromRange(range["startAddress"], range["endAddress"]))
                 targetExternalNetwork = self.rollback.apiData['targetExternalNetwork'][t0Gateway]
                 ipSpaces = self.getProviderGatewayIpSpaces(targetExternalNetwork)
@@ -882,7 +885,118 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                         'TENANT-{}-{}-{}'.format(
                             value['orgRef']['id'],
                             value['applicationPorts'][0]['protocol'], portString[1:])] = value
+            # PATCH-9: index every tenant profile by name as well (also multi-port ones), so an existing
+            # profile with the name the tool would create is found and reused instead of colliding
+            if value.get('scope') == 'TENANT' and isinstance(value.get('orgRef'), dict) and value.get('name'):
+                applicationPortProfilesDict['NAME-{}-{}'.format(value['orgRef']['id'], value['name'])] = value
         return applicationPortProfilesDict
+
+    # PATCH-9: helpers for application port profile reuse ----------------------------------
+    @staticmethod
+    def _portProfileMatches(profile, protocol, port):
+        """True if the profile defines exactly this protocol and set of destination ports."""
+        ports = listify((profile or {}).get('applicationPorts'))
+        if len(ports) != 1:
+            return False
+        existingProtocol = str(ports[0].get('protocol', '')).upper()
+        existingPorts = set(str(p).strip() for p in (ports[0].get('destinationPorts') or ['any']))
+        wantedPorts = set(p.strip() for p in str(port).split(',') if p.strip()) or {'any'}
+        return existingProtocol == protocol.upper() and existingPorts == wantedPorts
+
+    PORT_PROFILE_NAME_MAX = 128
+
+    def _getOrgTenantPortProfiles(self, orgId, contextId=None, refresh=False):
+        """
+        Tenant scoped application port profiles of the organization (cached per run).
+        PATCH-9: with contextId (the target Org VDC id) only profiles usable in that context are returned,
+        i.e. profiles realized on the same NSX-T Manager. If VCD does not accept a context filter, the
+        organization-wide list is used and a warning is logged.
+        """
+        import urllib.parse
+        cache = getattr(self, '_orgTenantPortProfilesCache', {})
+        cacheKey = (orgId, contextId)
+        if cacheKey in cache and not refresh:
+            return cache[cacheKey]
+        baseUrl = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.APPLICATION_PORT_PROFILES)
+        options = []
+        if contextId:
+            options.append(('context+org', '(_context=={};scope==TENANT;orgRef.id=={})'.format(contextId, orgId)))
+            options.append(('context', '(_context=={})'.format(contextId)))
+        options.append(('org', '(scope==TENANT;orgRef.id=={})'.format(orgId)))
+        options.append(('unfiltered', None))
+        profiles, usedOption = None, None
+        for optionName, fiql in options:
+            collected, page, failed = [], 1, False
+            while True:
+                url = "{}?page={}&pageSize=128&sortAsc=name".format(baseUrl, page)
+                if fiql:
+                    url += "&filter={}".format(urllib.parse.quote(fiql, safe=''))
+                getSession(self)
+                response = self.restClientObj.get(url, self.headers)
+                if response.status_code != requests.codes.ok:
+                    failed = True
+                    break
+                body = response.json()
+                collected.extend(body.get('values') or [])
+                if page >= int(body.get('pageCount') or 1):
+                    break
+                page += 1
+            if not failed:
+                profiles = [profile for profile in collected
+                            if profile.get('scope') == 'TENANT'
+                            and (profile.get('orgRef') or {}).get('id') == orgId]
+                usedOption = optionName
+                break
+            logger.debug("PATCH-9: application port profile query '{}' not accepted, trying next option".format(optionName))
+        if profiles is None:
+            raise Exception("Failed to list application port profiles of organization {}".format(orgId))
+        if contextId and usedOption not in ('context+org', 'context') and \
+                not getattr(self, '_portProfileContextWarned', False):
+            logger.warning("PATCH-9: VCD did not accept a context filter for application port profiles; reused "
+                           "profiles cannot be verified to belong to the target NSX-T Manager")
+            self._portProfileContextWarned = True
+        cache[cacheKey] = profiles
+        self._orgTenantPortProfilesCache = cache
+        return profiles
+
+    @classmethod
+    def _portProfileBaseName(cls, protocol, port, reserve=0):
+        """
+        PATCH-9: CUSTOM-<protocol>-<port>, shortened when too long for VCD. Long names keep the start of the
+        port list and end with a hash of protocol and ports, so the same definition always gets the same name.
+        reserve: characters that must remain free for a suffix.
+        """
+        import hashlib
+        name = "CUSTOM-{}-{}".format(protocol, port)
+        if len(name) + reserve <= cls.PORT_PROFILE_NAME_MAX:
+            return name
+        normalized = ','.join(sorted(set(p.strip() for p in str(port).split(',') if p.strip())))
+        digest = hashlib.sha1("{}:{}".format(protocol, normalized).encode('utf-8')).hexdigest()[:8]
+        head = "CUSTOM-{}-".format(protocol)
+        keep = cls.PORT_PROFILE_NAME_MAX - reserve - len(head) - 1 - len(digest)
+        prefix = normalized[:max(keep, 0)].rstrip(', ')  # normalized, so port order does not change the name
+        return "{}{}~{}".format(head, prefix, digest)
+
+    def _findTenantPortProfileByName(self, applicationPortProfilesDict, orgId, name, refresh=False, contextId=None):
+        """
+        Looks up a tenant profile by name: first in the run's index, then directly in VCD.
+        With contextId only profiles usable in the target context (same NSX-T Manager) are considered.
+        """
+        if not refresh and not contextId:
+            profile = applicationPortProfilesDict.get('NAME-{}-{}'.format(orgId, name))
+            if profile:
+                return profile
+        for profile in self._getOrgTenantPortProfiles(orgId, contextId=contextId, refresh=refresh):
+            if profile.get('name') == name:
+                applicationPortProfilesDict['NAME-{}-{}'.format(orgId, name)] = profile
+                return profile
+        return None
+
+    @staticmethod
+    def _cachePortProfile(applicationPortProfilesDict, orgId, protocol, port, profile):
+        applicationPortProfilesDict['TENANT-{}-{}-{}'.format(orgId, protocol, port)] = profile
+        applicationPortProfilesDict['NAME-{}-{}'.format(orgId, profile['name'])] = profile
+    # ---------------------------------------------------------------------------------------
 
     @isSessionExpired
     def _searchApplicationPortProfile(self, applicationPortProfilesDict, protocol, port):
@@ -902,18 +1016,40 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
             if value:
                 logger.debug(f"Application Port Profile {value['id']} for the {protocol}-{port} retrieved successfully")
                 return value['name'], value['id']
-            else:
+
+            # PATCH-9: find or reuse before creating. Names are unique per organization, so a profile left by
+            # an earlier run (another Org VDC of the same organization, or a rolled back migration) or created
+            # by the tenant must be reused when it matches, or avoided when it does not.
+            orgId = data['Organization']['@id']
+            targetContextId = data['targetOrgVDC']['@id']
+            vdcSuffix = targetContextId.split(':')[-1][:8]
+            # base name is shortened (with a stable hash) if it would exceed VCD's name length, leaving room
+            # for the "-<vdcSuffix>" variant
+            baseName = self._portProfileBaseName(protocol, port, reserve=len(vdcSuffix) + 1)
+            for candidateName in (baseName, "{}-{}".format(baseName, vdcSuffix)):
+                # only profiles usable in the target Org VDC context (same NSX-T Manager) may be reused
+                existing = self._findTenantPortProfileByName(applicationPortProfilesDict, orgId, candidateName,
+                                                             contextId=targetContextId)
+                if existing:
+                    if self._portProfileMatches(existing, protocol, port):
+                        logger.debug("PATCH-9: reusing existing application port profile {}".format(candidateName))
+                        self._cachePortProfile(applicationPortProfilesDict, orgId, protocol, port, existing)
+                        return existing['name'], existing['id']
+                    logger.debug("PATCH-9: application port profile name {} is taken by a different definition, "
+                                 "trying the next name".format(candidateName))
+                    continue
+
                 url = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
                                     vcdConstants.APPLICATION_PORT_PROFILES)
                 payloadDict = {
-                    "name": "CUSTOM-" + protocol + "-" + port,
+                    "name": candidateName,
                     "applicationPorts": [{
                         "protocol": protocol,
                         "destinationPorts": listify(port.split(','))
                     }],
                     "orgRef": {
                         "name": data['Organization']['@name'],
-                        "id": data['Organization']['@id']
+                        "id": orgId
                     },
                     "contextEntityId": data['targetOrgVDC']['@id'],
                     "scope": "TENANT"
@@ -924,14 +1060,35 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                 if response.status_code == requests.codes.accepted:
                     taskUrl = response.headers['Location']
                     portprofileID = self._checkTaskStatus(taskUrl=taskUrl, returnOutput=True)
-                    logger.debug('Application port profile is created successfully ')
-                    customID = 'urn:vcloud:applicationPortProfile:' + portprofileID
-                    payloadDict['id'] = customID
-                    applicationPortProfilesDict[
-                        'TENANT-{}-{}-{}'.format(payloadDict['orgRef']['id'], payloadDict['applicationPorts'][0]['protocol'], port)] = payloadDict
+                    logger.debug('Application port profile {} is created successfully'.format(candidateName))
+                    payloadDict['id'] = 'urn:vcloud:applicationPortProfile:' + portprofileID
+                    self._cachePortProfile(applicationPortProfilesDict, orgId, protocol, port, payloadDict)
                     return payloadDict['name'], payloadDict['id']
-                response = response.json()
-                raise Exception('Failed to create application port profile {} '.format(response['message']))
+
+                # Creation refused: the name may exist although the listing did not show it.
+                errorMessage = response.json().get('message', response.status_code)
+                existing = self._findTenantPortProfileByName(applicationPortProfilesDict, orgId, candidateName,
+                                                             refresh=True, contextId=targetContextId)
+                if existing and self._portProfileMatches(existing, protocol, port):
+                    logger.debug("PATCH-9: creation of {} refused ({}); reusing the existing profile".format(
+                        candidateName, errorMessage))
+                    self._cachePortProfile(applicationPortProfilesDict, orgId, protocol, port, existing)
+                    return existing['name'], existing['id']
+                if existing:
+                    # name exists in this context with a different definition -> next candidate name
+                    continue
+                # not visible in the target context: does the name exist elsewhere in the organization
+                # (e.g. on another NSX-T Manager)? Then avoid it; otherwise the failure is real.
+                if self._findTenantPortProfileByName(applicationPortProfilesDict, orgId, candidateName, refresh=True):
+                    logger.debug("PATCH-9: name {} exists outside the target context, trying the next name".format(
+                        candidateName))
+                    continue
+                raise Exception('Failed to create application port profile {} : {}'.format(
+                    candidateName, errorMessage))
+
+            raise Exception("Application port profile names {} and {}-{} already exist in organization {} with a "
+                            "different definition; rename or remove one of them and rerun".format(
+                                baseName, baseName, vdcSuffix, data['Organization']['@name']))
         except Exception:
             raise
 

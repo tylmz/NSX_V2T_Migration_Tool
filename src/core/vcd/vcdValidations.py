@@ -1100,6 +1100,91 @@ class VCDMigrationValidation:
         except Exception: 
             raise
 
+
+    # PATCH-8: vApp lease validation -------------------------------------------------------
+    LEASE_WARNING_HOURS = 72
+
+    @staticmethod
+    def _parseVcdDateTime(value):
+        """Parses VCD ISO-8601 timestamps (e.g. 2026-10-12T08:23:35.123+03:00 or ...Z) to aware datetime."""
+        import datetime as _dt
+        if not value:
+            return None
+        text = str(value).strip().replace('Z', '+00:00')
+        match = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:?\d{2})?$', text)
+        if not match:
+            return None
+        base, fraction, offset = match.groups()
+        parsed = _dt.datetime.strptime(base, '%Y-%m-%dT%H:%M:%S')
+        if fraction:
+            parsed = parsed.replace(microsecond=int((fraction[1:] + '000000')[:6]))
+        if offset:
+            offset = offset.replace(':', '')
+            sign = 1 if offset[0] == '+' else -1
+            delta = _dt.timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
+            parsed = parsed.replace(tzinfo=_dt.timezone(sign * delta))
+        else:
+            parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+        return parsed
+
+    @isSessionExpired
+    def validateVappLeases(self, sourceOrgVDCId, v2tAssessmentMode=False, warningHours=None):
+        """
+        Description :   PATCH-8: Checks runtime (deployment) and storage leases of all vApps in the Org VDC.
+                        An expired storage lease blocks operations on the vApp, so the vApp move would fail
+                        in the middle of a migration window. A lease expiring during the window powers off or
+                        suspends the vApp.
+                        - Expired storage lease          -> ValidationError (precheck fails)
+                        - Lease expiring within N hours  -> warning (ValidationError in assessment mode)
+        Parameters  :   sourceOrgVDCId     -  ID of source org vdc (STRING)
+                        v2tAssessmentMode  -  Report soon-expiring leases as validation errors (BOOLEAN)
+                        warningHours       -  Look-ahead window in hours (INT), default LEASE_WARNING_HOURS
+        """
+        import datetime as _dt
+        warningHours = warningHours or self.LEASE_WARNING_HOURS
+        vAppList = self.getOrgVDCvAppsList(sourceOrgVDCId)
+        if not vAppList:
+            return
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        horizon = now + _dt.timedelta(hours=warningHours)
+        expired, expiringSoon = [], []
+        for vApp in vAppList:
+            response = self.restClientObj.get(vApp['@href'], self.headers)
+            if response.status_code != requests.codes.ok:
+                raise Exception("Failed to get vApp {} details to validate leases".format(vApp['@name']))
+            vAppData = self.vcdUtils.parseXml(response.content).get('VApp', {})
+            leaseSection = vAppData.get('LeaseSettingsSection') or {}
+
+            storageExpiry = self._parseVcdDateTime(leaseSection.get('StorageLeaseExpiration'))
+            runtimeExpiry = self._parseVcdDateTime(leaseSection.get('DeploymentLeaseExpiration'))
+
+            if storageExpiry and storageExpiry <= now:
+                expired.append("{} (storage lease expired {})".format(vApp['@name'], storageExpiry.isoformat()))
+                continue
+            soon = []
+            if storageExpiry and storageExpiry <= horizon:
+                soon.append("storage lease expires {}".format(storageExpiry.isoformat()))
+            if runtimeExpiry and now < runtimeExpiry <= horizon:
+                soon.append("runtime lease expires {}".format(runtimeExpiry.isoformat()))
+            if soon:
+                expiringSoon.append("{} ({})".format(vApp['@name'], ', '.join(soon)))
+
+        if expiringSoon:
+            message = "vApp leases expiring within {} hours - renew them before the migration window: {}".format(
+                warningHours, '; '.join(expiringSoon))
+            if v2tAssessmentMode and not expired:
+                raise ValidationError(message)
+            logger.warning(message)
+
+        if expired:
+            raise ValidationError(
+                "vApps with expired storage lease exist in source Org VDC (renew or delete them before "
+                "migration): {}".format('; '.join(expired)))
+
+        logger.debug("Validated successfully, no vApp leases expired or expiring within {} hours".format(warningHours))
+    # ---------------------------------------------------------------------------------------
+
     @isSessionExpired
     def getOrgVDCvAppsList(self, orgVDCId):
         """
@@ -1542,6 +1627,157 @@ class VCDMigrationValidation:
         except:
             raise
 
+
+    # PATCH-10: transport subnet handling ------------------------------------------------------------
+    # Opt-in through 'TransportSubnets' (list of CIDR ranges) in the Org VDC section of the user input.
+    # Without it nothing changes. With it, the uplink subnet that holds an edge's default gateway is treated
+    # as a transport link to the upstream router when it lies inside one of the ranges: it is not required on
+    # the target provider gateway, not configured on the target Tier-1 and not added to target pools.
+    # The subnet is kept (original behaviour) when NAT, IPsec or load balancer configuration uses its addresses.
+
+    def _transportRanges(self):
+        ranges = []
+        for item in listify(self.orgVdcInput.get('TransportSubnets')):
+            try:
+                ranges.append(ipaddress.ip_network(str(item).strip(), strict=False))
+            except ValueError:
+                logger.warning("PATCH-10: ignoring invalid TransportSubnets entry '{}'".format(item))
+        return ranges
+
+    def _transportDependencies(self, edgeGatewayId, transportNetwork):
+        """Returns NAT/IPsec/LB configuration that uses addresses of the transport subnet (hard dependencies)
+        and firewall references (informational)."""
+        def overlaps(value):
+            for part in str(value or '').split(','):
+                part = part.strip()
+                if not part or part.lower() == 'any':
+                    continue
+                try:
+                    if '-' in part:
+                        start, end = [ipaddress.ip_address(p.strip()) for p in part.split('-', 1)]
+                        nets = list(ipaddress.summarize_address_range(start, end))
+                    else:
+                        nets = [ipaddress.ip_network(part, strict=False)]
+                except ValueError:
+                    continue
+                if any(n.version == transportNetwork.version and n.subnet_of(transportNetwork) for n in nets):
+                    return True
+            return False
+
+        hard, soft = [], []
+        natConfig = self.getEdgeGatewayNatConfig(edgeGatewayId, validation=False) or {}
+        for rule in listify((natConfig.get('natRules') or {}).get('natRule')):
+            if rule.get('ruleType', 'user') != 'user':
+                continue
+            for field in ('originalAddress', 'translatedAddress'):
+                if overlaps(rule.get(field)):
+                    hard.append("NAT rule {} {}={}".format(rule.get('ruleId'), field, rule.get(field)))
+
+        url = "{}{}{}".format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress), vcdConstants.NETWORK_EDGES,
+                              vcdConstants.EDGE_GATEWAY_IPSEC_CONFIG.format(edgeGatewayId))
+        response = self.restClientObj.get(url, {'Authorization': self.headers['Authorization'],
+                                                'Accept': vcdConstants.GENERAL_JSON_ACCEPT_HEADER})
+        if response.status_code == requests.codes.ok:
+            ipsec = response.json() or {}
+            if ipsec.get('enabled') and ipsec.get('sites'):
+                for site in listify(ipsec['sites'].get('sites')):
+                    if overlaps(site.get('localIp')):
+                        hard.append("IPsec site {} localIp={}".format(site.get('name'), site.get('localIp')))
+
+        url = "{}{}".format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress),
+                            vcdConstants.EDGE_GATEWAY_VIRTUAL_SERVER_CONFIG.format(edgeGatewayId))
+        response = self.restClientObj.get(url, self.headers)
+        if response.status_code == requests.codes.ok:
+            lbData = self.vcdUtils.parseXml(response.content) or {}
+            for virtualServer in listify((lbData.get('loadBalancer') or {}).get('virtualServer')):
+                if overlaps(virtualServer.get('ipAddress')):
+                    hard.append("LB virtual server {} ip={}".format(virtualServer.get('name'), virtualServer.get('ipAddress')))
+
+        firewallRules = self.getEdgeGatewayFirewallConfig(edgeGatewayId, validation=False)
+        for rule in listify(firewallRules if isinstance(firewallRules, list) else []):
+            for side in ('source', 'destination'):
+                for value in listify((rule.get(side) or {}).get('ipAddress')):
+                    if overlaps(value):
+                        soft.append("firewall rule {} {}={}".format(rule.get('name'), side, value))
+        return hard, soft
+
+    def getTransportSubnet(self, edgeGateway):
+        """
+        PATCH-10: (gateway, prefixLength) of the edge's transport subnet, or None.
+        The decision is taken once (precheck/validation) and stored in metadata ('transportSubnets'), so later
+        phases and rollback use exactly the same result.
+        """
+        ranges = self._transportRanges()
+        if not ranges:
+            # feature not configured: original behaviour, nothing stored
+            return None
+        data = self.rollback.apiData
+        stored = data.setdefault('transportSubnets', {})
+        if edgeGateway['name'] in stored:
+            value = stored[edgeGateway['name']]
+            return tuple(value) if value else None
+
+        stored[edgeGateway['name']] = None
+        edgeGatewayId = edgeGateway['id'].split(':')[-1]
+        defaultGateway = self.getEdgeGatewayDefaultGateway(edgeGatewayId)
+        if not defaultGateway:
+            logger.info("PATCH-10: edge gateway {} has no default gateway, no transport subnet".format(edgeGateway['name']))
+            return None
+        candidate = None
+        for uplink in edgeGateway.get('edgeGatewayUplinks') or []:
+            for subnet in (uplink.get('subnets') or {}).get('values') or []:
+                network = ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']), strict=False)
+                if ipaddress.ip_address(defaultGateway) in network:
+                    candidate = (subnet['gateway'], subnet['prefixLength'], network)
+        if not candidate:
+            return None
+        gateway, prefixLength, network = candidate
+        if not any(network.version == r.version and network.subnet_of(r) for r in ranges):
+            logger.info("PATCH-10: default gateway subnet {} of edge gateway {} is not inside TransportSubnets, "
+                        "keeping it".format(network, edgeGateway['name']))
+            return None
+        hard, soft = self._transportDependencies(edgeGatewayId, network)
+        if hard:
+            logger.warning("PATCH-10: transport subnet {} of edge gateway {} is used by {} - it is NOT dropped and "
+                           "must exist on the target provider gateway as before".format(network, edgeGateway['name'], '; '.join(hard)))
+            return None
+        if soft:
+            logger.warning("PATCH-10: transport subnet {} of edge gateway {} is referenced by {} - these rules have no "
+                           "effect after migration".format(network, edgeGateway['name'], '; '.join(soft)))
+        logger.info("PATCH-10: edge gateway {}: transport subnet {} will not be migrated".format(edgeGateway['name'], network))
+        stored[edgeGateway['name']] = [gateway, prefixLength]
+        return (gateway, prefixLength)
+
+    def isTransportSubnet(self, edgeGatewayName, gateway, prefixLength):
+        value = (self.rollback.apiData.get('transportSubnets') or {}).get(edgeGatewayName)
+        return bool(value) and value[0] == gateway and int(value[1]) == int(prefixLength)
+
+    def getDmzNetworks(self, edgeGatewayName, orgVdcNetworks):
+        """PATCH-10: routed Org VDC networks of this edge whose subnet lies inside 'DmzStaticRoutes'."""
+        blocks = []
+        for item in listify(self.orgVdcInput.get('DmzStaticRoutes')):
+            try:
+                blocks.append(ipaddress.ip_network(str(item).strip(), strict=False))
+            except ValueError:
+                logger.warning("PATCH-10: ignoring invalid DmzStaticRoutes entry '{}'".format(item))
+        if not blocks:
+            return []
+        result = []
+        for network in orgVdcNetworks:
+            if network.get('networkType') != 'NAT_ROUTED':
+                continue
+            if ((network.get('connection') or {}).get('routerRef') or {}).get('name') != edgeGatewayName:
+                continue
+            for subnet in (network.get('subnets') or {}).get('values') or []:
+                try:
+                    net = ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']), strict=False)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if any(net.version == b.version and net.subnet_of(b) for b in blocks):
+                    result.append((network['name'], str(net)))
+        return result
+    # -------------------------------------------------------------------------------------------------
+
     @isSessionExpired
     def validateExternalNetworkSubnets(self):
         """
@@ -1562,6 +1798,15 @@ class VCDMigrationValidation:
             if 'sourceExternalNetwork' not in data.keys() or 'targetExternalNetwork' not in data.keys():
                 raise Exception('Target External Network not present')
 
+            # PATCH-10: report DMZ networks that will get Tier-0 static routes (only with DmzStaticRoutes)
+            if self.orgVdcInput.get('DmzStaticRoutes'):
+                dmzSourceNetworks = self.getOrgVDCNetworks(data['sourceOrgVDC']['@id'], 'sourceOrgVDCNetworks',
+                                                           saveResponse=False)
+                for edgeGateway in self.rollback.apiData['sourceEdgeGateway']:
+                    for networkName, cidr in self.getDmzNetworks(edgeGateway['name'], dmzSourceNetworks):
+                        logger.info("PATCH-10: edge gateway {}: DMZ network {} ({}) will get a Tier-0 static route"
+                                    .format(edgeGateway['name'], networkName, cidr))
+
             # Iterate over source edgeGateway and check subnets belongs to edgeGateway as well as external network.
             for edgeGateway in copy.deepcopy(self.rollback.apiData['sourceEdgeGateway']):
                 # Get the uplinks for edge gateway
@@ -1575,6 +1820,12 @@ class VCDMigrationValidation:
                 sourceExternalGatewayAndPrefixList = {(subnet['gateway'], subnet['prefixLength']) for edgeGatewayUplink
                                                       in edgeGatewayUplinksData for subnet in
                                                       edgeGatewayUplink['subnets']['values']}
+                # PATCH-10: leave the transport subnet out (only when TransportSubnets is configured)
+                transportSubnet = self.getTransportSubnet(edgeGateway)
+                if transportSubnet:
+                    sourceExternalGatewayAndPrefixList = {
+                        item for item in sourceExternalGatewayAndPrefixList
+                        if not (item[0] == transportSubnet[0] and int(item[1]) == int(transportSubnet[1]))}
                 sourceNetworkAddressList = [
                     ipaddress.ip_network('{}/{}'.format(externalGateway, externalPrefixLength), strict=False)
                     for externalGateway, externalPrefixLength in sourceExternalGatewayAndPrefixList]
@@ -1656,6 +1907,12 @@ class VCDMigrationValidation:
 
                 uplinkGatewayAndPrefixList = {(subnet['gateway'], subnet['prefixLength']) for subnet in
                                                       uplink['subnets']['values']}
+                # PATCH-10: the transport subnet is neither T0 nor T1 connected on the target
+                uplinkGatewayAndPrefixList = {
+                    item for item in uplinkGatewayAndPrefixList
+                    if not self.isTransportSubnet(edgeGateway['name'], item[0], item[1])}
+                if not uplinkGatewayAndPrefixList:
+                    continue
 
                 uplinkAddressList = [ipaddress.ip_network('{}/{}'.format(gateway, prefixLength), strict=False)
                                      for gateway, prefixLength in uplinkGatewayAndPrefixList]
@@ -4394,7 +4651,7 @@ class VCDMigrationValidation:
             if site['ipsecSessionType'] == "policybasedsession":
                 natErrorList, natRulesPresent, _ = self.getEdgeGatewayNatConfig(edgeGatewayId)
                 localSubnets = site.get('localSubnets')
-                for natrule in natRulesPresent:
+                for natrule in (natRulesPresent or []):  # PATCH-10: edges without NAT rules return False
                     if natrule['action'] == 'dnat' and natrule['ruleType'] == 'user':
                         for subnet in localSubnets.get('subnets'):
                             if "-" in natrule['translatedAddress']:
@@ -5958,6 +6215,10 @@ class VCDMigrationValidation:
 
             logger.info('Validating whether media is attached to any vApp VMs')
             self.validateVappVMsMediaNotConnected(sourceOrgVDCId)
+
+            # PATCH-8: expired / soon-expiring vApp leases
+            logger.info('Validating vApp runtime and storage leases')
+            self.validateVappLeases(sourceOrgVDCId)
 
             # get the affinity rules of source Org VDC
             logger.info('Getting the VM affinity rules of source Org VDC {}'.format(self.orgVdcInput["OrgVDCName"]))
