@@ -1,8 +1,8 @@
-# NSX Migration for VMware Cloud Director – v1.5 (community build)
+# NSX Migration for VMware Cloud Director – v1.5.4 (community build)
 
 A patched build of the **NSX Migration for VMware Cloud Director** tool, used to migrate NSX Data Center for vSphere (NSX-V) backed organization VDCs to NSX-T Data Center backed organization VDCs within the same VMware Cloud Director instance.
 
-> **Community build.** v1.5 is based on the upstream tag [`MT_v1.4.2.2.H001`](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/releases/tag/MT_v1.4.2.2.H001) of [Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool), with a small set of bug fixes and a Windows build. It is **not** an official VMware, Broadcom or Calsoft release and comes with no support or warranty. The tool changes production Cloud Director, NSX and vCenter objects: always test on a non-production organization VDC first, including a full rollback.
+> **Community build.** v1.5.4 is based on the upstream tag [`MT_v1.4.2.2.H001`](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/releases/tag/MT_v1.4.2.2.H001) of [Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool), with a small set of bug fixes and a Windows build. It is **not** an official VMware, Broadcom or Calsoft release and comes with no support or warranty. The tool changes production Cloud Director, NSX and vCenter objects: always test on a non-production organization VDC first, including a full rollback.
 
 ---
 
@@ -33,10 +33,14 @@ Every code change is marked with a `PATCH-n` comment. Full details are in [PATCH
 | **PATCH-1b** | Target IP pool update no longer adds an IP that is already in the target pool, so a target subnet can be pre-seeded with the edge gateway's own IP. |
 | **PATCH-2** | Crash in the static route check, and missed load balancer VIPs, when an edge gateway uplink carries more than one subnet. |
 | **PATCH-4** | `list index out of range` instead of a readable error when a required `-v2t` network is missing (upstream issues [#4](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/4) and [#7](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/7)). |
+| **PATCH-7** | Password files: on Windows the encryption key is protected with DPAPI and can only be used by the Windows account that created the file; on Linux the file is created readable by the owner only. |
+| **PATCH-8** | New vApp lease check: precheck fails on vApps with an expired storage lease and warns about leases expiring within 72 hours; the assessment report gets a 'vApp lease expired or expiring soon' column. |
+| **PATCH-9** | Application port profiles are reused instead of colliding when a second Org VDC of the same organization is migrated later, after a rollback and re-migration, or when a tenant profile has the same name; only profiles of the target NSX-T Manager are reused, and very long port lists get shortened names (upstream issue [#2](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/2)). |
+| **PATCH-10** | Optional transport-free migration: `TransportSubnets` leaves an edge's transport (default route) subnet out of the target, `DmzStaticRoutes` creates provider Tier-0 static routes for routed public networks. Also fixes the precheck crash for policy-based IPsec on edges without NAT rules. Without these keys nothing changes. |
 | **PATCH-5** | Compatibility with `pycryptodome`, which allows a Windows build on Python 3.8/3.9. Behavior is identical to the original `pycrypto` code. |
 | **Build** | `pyinstaller-hooks-contrib` pinned to a version compatible with PyInstaller 4.5.1, spec file cleanup, `build_windows.bat`. |
 
-The console shows `Build Version: v1.5` at startup.
+The console shows `Build Version: v1.5.4` at startup.
 
 ---
 
@@ -56,7 +60,7 @@ For the full list of prerequisites, supported features and unsupported features,
 
 ### Windows
 
-1. Download `vcdNSXMigrator-v1.5-win64.zip` from the [Releases](../../releases) page.
+1. Download `vcdNSXMigrator-v1.5.4-win64.zip` from the [Releases](../../releases) page.
 2. Extract it to a local folder, for example `C:\v2t\`. Avoid OneDrive or other synced folders.
 3. Keep the whole `vcdNSXMigrator` folder together; the executable needs the files next to it. OpenSSL binaries are bundled (the tool calls `openssl` for certificate operations).
 4. Check that it runs:
@@ -156,6 +160,8 @@ Key options worth understanding:
 | `AdvertiseRoutedNetworks` | `True` forces a **dedicated** provider gateway. On a shared legacy provider gateway the precheck rejects it. |
 | `EdgeClusterName` (under `NSXT`) | Bridging edge clusters. Optional; omit it when bridging is skipped. |
 | `ImportedNetworkTransportZone` | NSX-T VLAN transport zone, needed only for dedicated direct networks. |
+| `TransportSubnets` *(v1.5.4, optional)* | List of CIDR ranges. The edge's default-route uplink subnet inside these ranges is not migrated (no provider gateway subnet needed, no Tier-1 address). Kept automatically if NAT, IPsec or load balancer rules use its addresses. Omit to keep the original behaviour. |
+| `DmzStaticRoutes` *(v1.5.4, optional)* | List of public CIDR blocks. Routed networks inside them get a static route on the provider Tier-0/VRF towards the tenant Tier-1 in the services phase; rollback removes them. The Tier-0 must redistribute static routes into BGP, and the routers' old static routes must be removed in the window. Omit to keep the original behaviour. |
 | `MaxThreadCount` / `TimeoutForVappMigration` | Parallel vApp moves and per-vApp timeout (seconds). Size them to your vMotion bandwidth. |
 
 ---
@@ -241,7 +247,6 @@ These come from upstream behavior and are **not** changed in v1.5:
 - **Every external subnet needs a static pool.** VCD rejects external network subnets with an empty static IP pool.
 - **Static routes** whose next hop is reached through a Tier-0 connected uplink are reported as warnings and **not migrated**; configure them manually on the Tier-1 or Tier-0/VRF.
 - **NAT rules with ranges** are only partly validated: the precheck catches ranges in DNAT translated addresses, but ranges in DNAT original addresses or SNAT addresses pass the precheck and fail during `services` (issue [#6](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/6)). Check NAT rules before the window.
-- **Application port profiles** are reused within a run; when a second org VDC of the same organization is migrated in a later run, a `CUSTOM-...` profile name conflict is possible (issue [#2](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/2)).
 - **VCD 10.6** is not supported (issue [#21](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/21)).
 - `movevapp` moves all vApps of an org VDC; there is no per-vApp selection (feature request [#5](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/5)).
 
@@ -254,7 +259,7 @@ These come from upstream behavior and are **not** changed in v1.5:
 Requirements: Python **3.8 or 3.9** x64 (PyInstaller 4.5.1 does not support newer versions), [Win64 OpenSSL Light](https://slproweb.com/products/Win32OpenSSL.html) installed in `C:\Program Files\OpenSSL-Win64`, internet access for pip.
 
 ```
-git clone -b release/v1.5 https://github.com/tylmz/NSX_V2T_Migration_Tool.git
+git clone -b release/v1.5 https://github.com/<you>/NSX_V2T_Migration_Tool.git
 cd NSX_V2T_Migration_Tool
 build_windows.bat
 ```
@@ -273,7 +278,7 @@ source venv/bin/activate
 pip install -r requirements_build.txt
 pip install -r src/requirements-windows.txt     # pycryptodome variant, works on Linux too
 python -m PyInstaller --noconfirm src/vcdNSXMigrator.spec
-tar -czf vcdNSXMigrator-v1.5-linux.tar.gz -C dist vcdNSXMigrator
+tar -czf vcdNSXMigrator-v1.5.4-linux.tar.gz -C dist vcdNSXMigrator
 ```
 
 `openssl` must be available on the PATH of the machine running the tool.
@@ -282,7 +287,8 @@ tar -czf vcdNSXMigrator-v1.5-linux.tar.gz -C dist vcdNSXMigrator
 
 ## Security notes
 
-- The password file stores the encryption key next to the encrypted passwords – treat it as plain text. Restrict its permissions and delete it when the migration project ends.
+- On Windows, password files created by v1.5.4 can only be decrypted by the same Windows user on the same machine (DPAPI). Copy them elsewhere and they are useless; they are not portable between machines either – create a new one on each migration client. Files from older builds still work but are not protected: delete them and let v1.5.4 create new ones.
+- On Linux, the password file is created readable by its owner only, but the key is still stored in the file – treat it as sensitive and delete it when the migration project ends.
 - Do not commit filled-in `userInput*.yml` files, logs or reports: they contain hostnames, organization names and IP addresses. The repository `.gitignore` excludes them.
 - The tool's dependencies are pinned to 2021 versions for build compatibility. Run it from a dedicated, isolated migration client.
 - Use `verify: True` and `CertificatePath` when your certificates are trusted, instead of disabling certificate validation.
