@@ -69,6 +69,7 @@ class VMwareCloudDirectorNSXMigrator():
         self.utils = Utilities()
         self.executionMode = None
         self.cleanup = None
+        self.moveCatalog = False  # PATCH-11
         self.assessmentMode = None
         self.v2tAssessment = None
         self.userInputFilePath = None
@@ -93,6 +94,11 @@ class VMwareCloudDirectorNSXMigrator():
         parser.add_argument("--cleanup", dest="cleanupValue", action="store_const",
                             help='Cleanup workflow (OPTIONAL ARGUMENT)',
                             const=True, default=False, required=False)
+        # PATCH-11: move catalog items of the source Org VDCs to '-v2t' catalogs on the target, without waiting for cleanup
+        parser.add_argument("--movecatalog", dest="moveCatalog", action="store_true", default=False, required=False,
+                            help='Move catalog items (vApp templates/media) to <catalog>-v2t catalogs on the target Org VDC. '
+                                 'Run after movevapp. Rollback moves them back; cleanup deletes the source catalogs and '
+                                 'removes the -v2t suffix (OPTIONAL ARGUMENT)')
         parser.add_argument("--preCheck", dest='preCheck', help='PreCheck workflow (OPTIONAL ARGUMENT)',
                             action="store_true", default=False, required=False)
         parser.add_argument("--passwordFile", dest="passwordFilePath",
@@ -111,6 +117,10 @@ class VMwareCloudDirectorNSXMigrator():
         if args.cleanupValue:
             self.cleanup = args.cleanupValue
             self.executionMode = 'cleanup'
+        elif args.moveCatalog:
+            # PATCH-11
+            self.moveCatalog = True
+            self.executionMode = 'movecatalog'
         elif args.preCheck:
             self.executionMode = 'preCheck'
             self.assessmentMode = args.preCheck
@@ -164,7 +174,9 @@ class VMwareCloudDirectorNSXMigrator():
             (args.v2tAssessment and (args.cleanupValue or args.preCheck or args.rollback)) or \
             (args.v2tAssessment and (args.skip or args.execute)) or \
             (args.cleanupValue and (args.skip or args.execute)) or \
-            (args.rollback and (args.skip or args.execute)):
+            (args.rollback and (args.skip or args.execute)) or \
+            (args.moveCatalog and (not args.filePath or args.cleanupValue or args.preCheck or args.rollback or
+                                   args.v2tAssessment or args.skip or args.execute)):
             parser.print_help()
             raise Exception("Invalid Input Arguments")
 
@@ -840,6 +852,16 @@ class VMwareCloudDirectorNSXMigrator():
                 futures.append(executor.submit(cleanup.run))
             waitForThreadToComplete(futures)
 
+    def runMoveCatalog(self):
+        """PATCH-11: moves the catalog items of every Org VDC in the input file to '-v2t' catalogs on its target."""
+        futures = list()
+        with ThreadPoolExecutor(max_workers=self.numberOfParallelMigrations) as executor:
+            for vcdObj in self.vcdObjList:
+                futures.append(executor.submit(vcdObj.moveCatalogsToTarget,
+                                               self.inputDict["VCloudDirector"]["Organization"]["OrgName"],
+                                               self.timeoutForVappMigration))
+            waitForThreadToComplete(futures)
+
     def runPreMigrationValidation(self):
         # Perform premigration validations
         futures = list()
@@ -1038,6 +1060,11 @@ class VMwareCloudDirectorNSXMigrator():
             # Running cleanup script if cleanup parameter is provided
             if self.cleanup:
                 self.runCleanup()
+                return
+
+            # PATCH-11: move catalog items to the target Org VDC
+            if self.moveCatalog:
+                self.runMoveCatalog()
                 return
 
             self.runPreMigrationValidation()

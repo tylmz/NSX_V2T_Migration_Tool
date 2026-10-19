@@ -96,17 +96,22 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         if not self.orgVdcInput.get('DmzStaticRoutes'):
             return
         data = self.rollback.apiData
-        sourceNetworks = self.getOrgVDCNetworks(data['sourceOrgVDC']['@id'], 'sourceOrgVDCNetworks', saveResponse=False)
+        # PATCH-12: services has already made the source routed networks ISOLATED (connection removed) at this
+        # point, so the DMZ networks are taken from the target Org VDC networks, now connected to the Tier-1s
+        targetNetworks = self.getOrgVDCNetworks(data['targetOrgVDC']['@id'], 'targetOrgVDCNetworks', saveResponse=False)
         created = data.get('dmzStaticRoutes') or []
+        foundDmzNetwork = False
         for targetEdgeGateway in data.get('targetEdgeGateway', []):
             edgeName = targetEdgeGateway['name']
             edgeInput = self.orgVdcInput['EdgeGateways'].get(edgeName, {})
             if edgeInput.get('AdvertiseRoutedNetworks'):
                 logger.info("PATCH-10: {} advertises routed networks, no DMZ static routes needed".format(edgeName))
                 continue
-            dmzNetworks = self.getDmzNetworks(edgeName, sourceNetworks)
+            dmzNetworks = self.getDmzNetworks(edgeName, targetNetworks)
             if not dmzNetworks:
+                logger.info("PATCH-12: edge gateway {}: no routed network inside DmzStaticRoutes".format(edgeName))
                 continue
+            foundDmzNetwork = True
             externalNetwork = data['targetExternalNetwork'][edgeInput['Tier0Gateways']]
             tier0Id = externalNetwork['networkBackings']['values'][0]['backingId']
             # fresh edge gateway details for the NSX-T Tier-1 id
@@ -145,6 +150,11 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 self.saveMetadataInOrgVdc(force=True)
                 logger.info("PATCH-10: Tier-0 {} static route {} -> {} created for DMZ network {}".format(
                     tier0Id, cidr, nextHop, networkName))
+        if not foundDmzNetwork:
+            # PATCH-12: never skip silently when the user asked for DMZ routes
+            logger.warning("PATCH-12: DmzStaticRoutes is set but no routed Org VDC network inside it was found on the "
+                           "target edge gateways - no Tier-0 static routes created")
+            return
         logger.info("PATCH-10: remove the upstream routers' static routes for these DMZ subnets so the BGP routes are used")
 
     def removeDmzStaticRoutes(self, nsxtObj):
@@ -3787,7 +3797,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         if vappVmList:
             self.updateCatalogVappVmPolicy(vappVmList, catalogItemResponseDict['@name'])
 
-    def migrateCatalogItems(self, sourceOrgVDCId, targetOrgVDCId, orgName, timeout):
+    def migrateCatalogItems(self, sourceOrgVDCId, targetOrgVDCId, orgName, timeout, finalize=True):
         """
         Description : Migrating Catalog Items - vApp Templates and Media & deleting catalog thereafter
         Parameters  :   sourceOrgVDCId  - source Org VDC id (STRING)
@@ -3867,13 +3877,21 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                     readAccessToAllOrg = srcCatalog.get('IsPublished')
                     # Function call to create a new Target side catalog
                     catalogId = self.createCatalog(payloadDict, orgId, owner, srcCatalogId, readAccessToAllOrg)
+                    catalogCreated = True
                 else:
+                    catalogCreated = False
                     catalogId = list(filter(lambda catalog: catalog["@name"] == payloadDict['catalogName'],
                     targetOrgVDCCatalogDetails))[0]["@id"].split(':')[-1]
+                if catalogId and not finalize:
+                    # PATCH-11 (--movecatalog): remember the pair for rollback and cleanup
+                    self._recordCatalogMove(srcCatalog['@href'], srcCatalog['@name'], srcCatalog.get('Description') or '',
+                                            catalogId, payloadDict['catalogName'], catalogCreated)
                 if catalogId:
                     # empty catalogs
                     if not srcCatalog.get('CatalogItems'):
                         logger.debug("Migrating empty catalog '{}'".format(srcCatalog['@name']))
+                        if not finalize:
+                            continue
                         # deleting the source org vdc catalog
                         self.deleteSourceCatalog(srcCatalog['@href'], srcCatalog)
                         # renaming the target org vdc catalog
@@ -3918,10 +3936,11 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                        'catalogItemHref': catalogItem['@href']}
                         self.moveCatalogItem(payloadDict, catalogId, timeout)
 
-                    # deleting the source org vdc catalog
-                    self.deleteSourceCatalog(srcCatalog['@href'], srcCatalog)
-                    # renaming the target org vdc catalog
-                    self.renameTargetCatalog(catalogId, srcCatalog)
+                    if finalize:
+                        # deleting the source org vdc catalog
+                        self.deleteSourceCatalog(srcCatalog['@href'], srcCatalog)
+                        # renaming the target org vdc catalog
+                        self.renameTargetCatalog(catalogId, srcCatalog)
 
                     # deleting the temporary lists
                     del vAppTemplateCatalogItemList
@@ -4035,9 +4054,16 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         readAccessToAllOrg = catalog.get('readAccessToAllOrg')
                         # Function call to create a new Target side catalog
                         catalogId = self.createCatalog(payloadDict, orgId, owner, srcCatalogId, readAccessToAllOrg)
+                        catalogCreated = True
                     else:
+                        catalogCreated = False
                         catalogId = list(filter(lambda catalog: catalog["@name"] == payloadDict['catalogName'],
                                                 targetOrgVDCCatalogDetails))[0]["@id"].split(':')[-1]
+                    if catalogId and not finalize:
+                        # PATCH-11 (--movecatalog): remember the pair for rollback and cleanup
+                        self._recordCatalogMove(catalog['catalogHref'], catalog['catalogName'],
+                                                catalog.get('catalogDescription') or '', catalogId,
+                                                payloadDict['catalogName'], catalogCreated)
                     if catalogId:
                         vAppTemplateCatalogItemList = []
                         mediaCatalogItemList = []
@@ -4080,10 +4106,11 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                        '@href': catalog['catalogHref'],
                                        'Description': catalog['catalogDescription']}
 
-                        # deleting the source org vdc catalog
-                        self.deleteSourceCatalog(catalogData['@href'], catalogData)
-                        # renaming the target org vdc catalog
-                        self.renameTargetCatalog(catalogId, catalogData)
+                        if finalize:
+                            # deleting the source org vdc catalog
+                            self.deleteSourceCatalog(catalogData['@href'], catalogData)
+                            # renaming the target org vdc catalog
+                            self.renameTargetCatalog(catalogId, catalogData)
 
                         # deleting the temporary lists
                         del vAppTemplateCatalogItemList
@@ -5668,6 +5695,103 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                                                                      sharePermissionsResponse))
         except Exception:
             raise
+
+    # PATCH-11: catalog moves before cleanup ---------------------------------------------------------------
+    def _recordCatalogMove(self, srcHref, srcName, srcDescription, dstId, dstName, created):
+        moves = self.rollback.apiData.get('catalogMoves') or []
+        if not any(move['dstId'] == dstId for move in moves):
+            moves.append({'srcHref': srcHref, 'srcName': srcName, 'srcDescription': srcDescription,
+                          'dstId': dstId, 'dstName': dstName, 'created': created})
+            self._saveCatalogMoves(moves)
+
+    def _saveCatalogMoves(self, moves, target=True):
+        """Persists the catalog move records in the source Org VDC metadata (used by rollback) and, after the
+        migration, in the target Org VDC metadata (used by cleanup)."""
+        self.rollback.apiData['catalogMoves'] = moves
+        self.saveMetadataInOrgVdc(force=True)
+        targetOrgVDCId = self.rollback.apiData.get('targetOrgVDC', {}).get('@id')
+        if target and targetOrgVDCId:
+            self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={'catalogMoves': moves})
+
+    def _catalogItems(self, catalogHref):
+        response = self.restClientObj.get(catalogHref, headers=self.headers)
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-11: failed to read catalog {}".format(catalogHref))
+        catalog = self.vcdUtils.parseXml(response.content)
+        catalog = catalog.get('AdminCatalog') or catalog.get('Catalog') or {}
+        return listify((catalog.get('CatalogItems') or {}).get('CatalogItem'))
+
+    def moveCatalogsToTarget(self, orgName, timeout):
+        """
+        PATCH-11 (--movecatalog): moves the catalog items stored on the source Org VDC to '<catalog>-v2t' catalogs
+        on the target Org VDC (created when missing), using the same logic as cleanup but without deleting the
+        source catalogs or renaming the new ones. Rollback moves the items back; cleanup finishes the job.
+        """
+        threading.current_thread().name = self.orgVdcInput["OrgVDCName"]
+        data = self.rollback.apiData
+        if not data.get('targetOrgVDC', {}).get('@id'):
+            raise Exception("PATCH-11: target Org VDC not found in metadata - run --movecatalog after the migration")
+        if not self.rollback.metadata.get('moveVapp'):
+            raise Exception("PATCH-11: vApps are not moved yet - run --movecatalog after the movevapp workflow")
+        logger.info("Moving catalog items of Org VDC {} to '-v2t' catalogs on the target".format(self.orgVdcInput["OrgVDCName"]))
+        self.migrateCatalogItems(data['sourceOrgVDC']['@id'], data['targetOrgVDC']['@id'], orgName, timeout,
+                                 finalize=False)
+        moves = data.get('catalogMoves') or []
+        logger.info("Catalog items moved for {} catalog(s): {}".format(
+            len(moves), ', '.join("{} -> {}".format(m['srcName'], m['dstName']) for m in moves) or 'none'))
+
+    def rollbackCatalogMoves(self, timeout=7200):
+        """PATCH-11: rollback of --movecatalog - moves all items of the '-v2t' catalogs back to the source catalogs."""
+        data = self.rollback.apiData
+        moves = data.get('catalogMoves') or []
+        if not moves:
+            return
+        logger.info("RollBack: Moving catalog items back to the source catalogs")
+        for move in list(moves):
+            dstHref = "{}{}".format(vcdConstants.XML_ADMIN_API_URL.format(self.ipAddress), "catalog/{}".format(move['dstId']))
+            srcId = move['srcHref'].rstrip('/').split('/')[-1]
+            for item in self._catalogItems(dstHref):
+                logger.debug("RollBack: moving catalog item '{}' back to '{}'".format(item['@name'], move['srcName']))
+                self.moveCatalogItem({'catalogItemName': item['@name'], 'catalogItemHref': item['@href']}, srcId, timeout)
+            if move.get('created') and not self._catalogItems(dstHref):
+                self.deleteSourceCatalog(dstHref, {'@name': move['dstName']})
+            moves.remove(move)
+            self._saveCatalogMoves(moves, target=False)
+        logger.info("RollBack: catalog items are back in the source catalogs")
+
+    def finalizeCatalogMoves(self):
+        """
+        PATCH-11: cleanup for --movecatalog pairs that cleanup's catalog migration did not finish itself
+        (catalogs without a storage policy): delete the empty source catalog and drop the '-v2t' suffix.
+        A source catalog that still holds items (e.g. of other Org VDCs) is kept; the '-v2t' catalog then keeps
+        its name and a warning is logged.
+        """
+        data = self.rollback.apiData
+        moves = data.get('catalogMoves') or []
+        if not moves:
+            return
+        for move in list(moves):
+            dstHref = "{}{}".format(vcdConstants.XML_ADMIN_API_URL.format(self.ipAddress), "catalog/{}".format(move['dstId']))
+            response = self.restClientObj.get(dstHref, headers=self.headers)
+            if response.status_code == requests.codes.ok:
+                dst = self.vcdUtils.parseXml(response.content).get('AdminCatalog', {})
+                if dst.get('@name') == move['dstName']:
+                    srcResponse = self.restClientObj.get(move['srcHref'], headers=self.headers)
+                    if srcResponse.status_code == requests.codes.ok:
+                        if self._catalogItems(move['srcHref']):
+                            logger.warning("PATCH-11: source catalog '{}' still has items - it is kept and '{}' keeps its "
+                                           "name".format(move['srcName'], move['dstName']))
+                            moves.remove(move)
+                            continue
+                        self.deleteSourceCatalog(move['srcHref'], {'@name': move['srcName']})
+                    self.renameTargetCatalog(move['dstId'], {'@name': move['srcName'], 'Description': move['srcDescription']})
+            moves.remove(move)
+        data['catalogMoves'] = moves
+        # PATCH-11 (v1.5.5 fix): save the finished list on the target so a re-run does not see stale pairs
+        targetOrgVDCId = data.get('targetOrgVDC', {}).get('@id')
+        if targetOrgVDCId:
+            self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={'catalogMoves': moves})
+    # --------------------------------------------------------------------------------------------------------
 
     @isSessionExpired
     def moveCatalogItem(self, catalogItem, catalogId, timeout):

@@ -1154,6 +1154,9 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                     # get details of all Non default gateway subnet, default gateway and noSnatRules
                     allnonDefaultGatewaySubnetList, defaultGatewayDict, noSnatRulesList = self.getEdgeGatewayNoSnatStaticRoute(
                         sourceEdgeGatewayId, staticRoutingConfig)
+                    # PATCH-13: Tier-0 uplinks are no longer "non-default" once the transport subnet is dropped
+                    allnonDefaultGatewaySubnetList = self.dropTier0UplinksWithoutTransport(
+                        sourceEdgeGateway['name'], allnonDefaultGatewaySubnetList)
                     natRuleList = data['natRules']['natRule']
                     # checking natrules is a list if not converting it into a list
                     sourceNATRules = natRuleList if isinstance(natRuleList, list) else [natRuleList]

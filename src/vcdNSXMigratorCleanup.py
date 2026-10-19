@@ -62,6 +62,8 @@ class VMwareCloudDirectorNSXMigratorCleanup():
                 "self.vcdObj.validateOrgVDCNSXbacking(sourceOrgVDCId, sourceProviderVDCId, isNSXTbacked)"],
             ["'Migrating catalog items - vApp Templates & media objects.'",
                 "self.vcdObj.migrateCatalogItems(sourceOrgVDCId, self.targetOrgVDCId, self.inputDict['VCloudDirector']['Organization']['OrgName'], self.timeoutForMoveCatalog)"],
+            ["'Finishing catalogs moved with --movecatalog.'",
+                "self.vcdObj.finalizeCatalogMoves()"],  # PATCH-11
             ["'Deleting empty vApps.'",
              "self.vcdObj.deleteEmptyvApp(sourceOrgVDCId)"],
             ["'Deleting the source Org VDC Networks.'",

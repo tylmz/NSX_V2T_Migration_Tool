@@ -72,6 +72,8 @@ class Rollback:
             'vcdObj.disablePromiscModeForgedTransmit()',
             'nsxtObj.deleteLogicalSegments()',
             'vcdObj.deleteOrgVDCGroup()',
+            # PATCH-11: catalogs go back last - after everything else, right before the target networks are deleted
+            'vcdObj.rollbackCatalogMoves()',
             'vcdObj.deleteOrgVDCNetworks(targetOrgVDCId, rollback=True)',
             'vcdObj.deleteNsxTBackedOrgVDCEdgeGateways(targetOrgVDCId)',
             'vcdObj.releaseFloatingIps()',

@@ -107,7 +107,7 @@ class Logger():
                 del config["handlers"]["pre-assessment"]
                 del config['loggers']['precheckLogger']
 
-            if executionMode == 'cleanup':
+            if executionMode in ('cleanup', 'movecatalog'):  # PATCH-11
                 # delete preCheck and inventory from handlers and loggers as it is not required in cleanup mode
                 del config["handlers"]["pre-assessment"]
                 del config['loggers']['precheckLogger']

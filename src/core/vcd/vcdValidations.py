@@ -1748,6 +1748,40 @@ class VCDMigrationValidation:
         stored[edgeGateway['name']] = [gateway, prefixLength]
         return (gateway, prefixLength)
 
+    def dropTier0UplinksWithoutTransport(self, edgeGatewayName, nonDefaultSubnets):
+        """
+        PATCH-13: when the edge's transport (default route) subnet is not migrated (TransportSubnets), the
+        uplink subnets that land on the Tier-0 uplink of the target become the edge's way out. NSX-V limited
+        SNAT on those subnets to traffic towards that subnet (they were not the default route), but on the
+        target all traffic leaves through the Tier-0, so their SNAT rules must keep the source destination.
+        Subnets that become Tier-1 service interfaces (segment-backed -v2t networks) keep the original
+        behaviour. Without TransportSubnets, or when the transport subnet is kept, nothing changes.
+        """
+        data = self.rollback.apiData
+        if not (data.get('transportSubnets') or {}).get(edgeGatewayName):
+            return nonDefaultSubnets
+        tier0Subnets = set()
+        for subnets in ((data.get('isT0Connected') or {}).get(edgeGatewayName) or {}).values():
+            for item in subnets or []:
+                try:
+                    tier0Subnets.add(ipaddress.ip_network('{}/{}'.format(item[0], item[1]), strict=False))
+                except (IndexError, TypeError, ValueError):
+                    continue
+        kept = []
+        for participant in nonDefaultSubnets:
+            try:
+                prefix = participant.get('subnetPrefixLength') or participant.get('netmask')
+                network = ipaddress.ip_network('{}/{}'.format(participant['gateway'], prefix), strict=False)
+            except (KeyError, TypeError, ValueError):
+                kept.append(participant)
+                continue
+            if network in tier0Subnets:
+                logger.info("PATCH-13: edge gateway {}: transport subnet not migrated, SNAT rules on uplink subnet {} "
+                            "keep their source destination (Tier-0 uplink)".format(edgeGatewayName, network))
+                continue
+            kept.append(participant)
+        return kept
+
     def isTransportSubnet(self, edgeGatewayName, gateway, prefixLength):
         value = (self.rollback.apiData.get('transportSubnets') or {}).get(edgeGatewayName)
         return bool(value) and value[0] == gateway and int(value[1]) == int(prefixLength)
@@ -2316,6 +2350,10 @@ class VCDMigrationValidation:
 
         edgeGatewayData = self.getEdgeGatewayAdminApiDetails(edgeGatewayId)
         for eachGatewayInterface in edgeGatewayData['configuration']['gatewayInterfaces']['gatewayInterface']:
+            # PATCH-12: subnets on the same uplink as the default route are not "non-default" uplinks. NSX-V applies
+            # an SNAT rule to all traffic leaving that vNIC, so their SNAT rules must keep destination 'any'
+            interfaceHasDefaultRoute = any(participant.get('useForDefaultRoute') == True
+                                           for participant in eachGatewayInterface['subnetParticipation'])
             for eachSubnetParticipant in eachGatewayInterface['subnetParticipation']:
                 # gather data of default gateway
                 if eachSubnetParticipant['useForDefaultRoute'] == True:
@@ -2334,7 +2372,8 @@ class VCDMigrationValidation:
                             '{}-{}'.format(
                                 eachSubnetParticipant['ipAddress'], eachSubnetParticipant['ipAddress']))
                 else:
-                    if eachGatewayInterface['interfaceType'] == 'uplink':
+                    # PATCH-12: only uplinks that do not carry the default route
+                    if eachGatewayInterface['interfaceType'] == 'uplink' and not interfaceHasDefaultRoute:
                         allnonDefaultGatewaySubnetList.extend(eachGatewayInterface['subnetParticipation'])
 
                         # if non default gateway interface has static routes
