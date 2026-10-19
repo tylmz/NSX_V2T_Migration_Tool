@@ -294,7 +294,6 @@ tar -czf vcdNSXMigrator-v1.5.7-linux.tar.gz -C dist vcdNSXMigrator
 
 - On Windows, password files created by v1.5.1 or later can only be decrypted by the same Windows user on the same machine (DPAPI). Copy them elsewhere and they are useless; they are not portable between machines either – create a new one on each migration client. Files from builds before v1.5.1 still work but are not protected: delete them and let the current build create new ones.
 - On Linux, the password file is created readable by its owner only, but the key is still stored in the file – treat it as sensitive and delete it when the migration project ends.
-- Do not commit filled-in `userInput*.yml` files, logs or reports: they contain hostnames, organization names and IP addresses. The repository `.gitignore` excludes them.
 - The tool's dependencies are pinned to 2021 versions for build compatibility. Run it from a dedicated, isolated migration client.
 - Use `verify: True` and `CertificatePath` when your certificates are trusted, instead of disabling certificate validation.
 
