@@ -2688,7 +2688,8 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
             for vnicData in vNicsDetails:
                 if sourceNATRule["vnic"] == vnicData["index"]:
                     if "portgroupName" in vnicData and (vnicData["portgroupName"] in self.rollback.apiData["sourceOrgVDCNetworks"] or \
-                        vnicData["portgroupName"] in self.rollback.apiData.get("isT1Connected", {}).get(sourceEdgeGatewayName, {})):
+                        vnicData["portgroupName"] in self.rollback.apiData.get("isT1Connected", {}).get(sourceEdgeGatewayName, {}) or \
+                        self.serviceUplinkPlan(sourceEdgeGatewayName, portgroupName=vnicData["portgroupName"])):  # PATCH-15
                         self.rollback.apiData["natInterfaces"][sourceEdgeGatewayId][sourceNATRule['ruleTag']] = vnicData["portgroupName"]
                     break
 

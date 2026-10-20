@@ -1,8 +1,8 @@
-# NSX Migration for VMware Cloud Director – v1.5.7 (community build)
+# NSX Migration for VMware Cloud Director – v1.5.8 (community build)
 
 A patched build of the **NSX Migration for VMware Cloud Director** tool, used to migrate NSX Data Center for vSphere (NSX-V) backed organization VDCs to NSX-T Data Center backed organization VDCs within the same VMware Cloud Director instance.
 
-> **Community build.** v1.5.7 is based on the upstream tag [`MT_v1.4.2.2.H001`](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/releases/tag/MT_v1.4.2.2.H001) of [Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool), with a small set of bug fixes and a Windows build. It is **not** an official VMware, Broadcom or Calsoft release and comes with no support or warranty. The tool changes production Cloud Director, NSX and vCenter objects: always test on a non-production organization VDC first, including a full rollback.
+> **Community build.** v1.5.8 is based on the upstream tag [`MT_v1.4.2.2.H001`](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/releases/tag/MT_v1.4.2.2.H001) of [Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool), with a small set of bug fixes and a Windows build. It is **not** an official VMware, Broadcom or Calsoft release and comes with no support or warranty. The tool changes production Cloud Director, NSX and vCenter objects: always test on a non-production organization VDC first, including a full rollback.
 
 ---
 
@@ -41,9 +41,11 @@ Every code change is marked with a `PATCH-n` comment. Full details are in [PATCH
 | **PATCH-11** | New `--movecatalog` mode: move catalog items to `<catalog>-v2t` catalogs on the target right after movevapp; rollback moves them back, cleanup removes the old catalogs and the `-v2t` suffix. |
 | **PATCH-12** | SNAT rules whose translated IP is on the same uplink as the edge's default route (for example a public /30 next to the transport subnet) were created with that uplink's subnet as destination instead of `any`, so outbound traffic was not translated. `DmzStaticRoutes` created no Tier-0 routes because it looked for the DMZ networks after `services` had already isolated the source networks; it now uses the target networks and warns when it finds none. |
 | **PATCH-13** | With `TransportSubnets`, when an edge's transport subnet is not migrated, SNAT rules on its other uplink subnets that move to the Tier-0 uplink (for example a public subnet on its own external network) keep the source destination instead of being limited to that subnet. SNAT rules on uplinks that become Tier-1 service interfaces (segment-backed `-v2t` networks) keep the original behaviour. |
+| **PATCH-14** | Static routes of the NSX-V edge: precheck records every route in metadata, logs its class and what will happen to it, and no longer fails on routes it cannot migrate. New optional `Tier1StaticRoutes` creates routes on the tenant Tier-1 (scoped to the network that holds the next hop), and `DmzStaticRoutes` now also covers Tier-1 static-route destinations, e.g. public blocks a customer firewall owns behind an internal interface. |
+| **PATCH-15** | Interfaces added to an NSX-V edge outside VCD (vCenter/NSX-V UI, e.g. MPLS or VPN VLANs). Detected and logged by precheck. With the optional per-edge `ServiceUplinks`, the tool creates an NSX-T VLAN segment and a VCD external network `<portgroup>-v2t`, moves the interface to the Tier-1 as a service interface with the same IPs, keeps NAT rules bound to it and adds NO_SNAT exceptions for traffic towards it. Only objects the tool created are ever changed or deleted. |
 | **Build** | `pyinstaller-hooks-contrib` pinned to a version compatible with PyInstaller 4.5.1, spec file cleanup, `build_windows.bat`. |
 
-The console shows `Build Version: v1.5.7` at startup. Version history: [CHANGELOG.md](CHANGELOG.md).
+The console shows `Build Version: v1.5.8` at startup. Version history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -63,7 +65,7 @@ For the full list of prerequisites, supported features and unsupported features,
 
 ### Windows
 
-1. Download `vcdNSXMigrator-v1.5.7-win64.zip` from the [Releases](../../releases) page.
+1. Download `vcdNSXMigrator-v1.5.8-win64.zip` from the [Releases](../../releases) page.
 2. Extract it to a local folder, for example `C:\v2t\`. Avoid OneDrive or other synced folders.
 3. Keep the whole `vcdNSXMigrator` folder together; the executable needs the files next to it. OpenSSL binaries are bundled (the tool calls `openssl` for certificate operations).
 4. Check that it runs:
@@ -165,6 +167,8 @@ Key options worth understanding:
 | `ImportedNetworkTransportZone` | NSX-T VLAN transport zone, needed only for dedicated direct networks. |
 | `TransportSubnets` *(v1.5.4+, optional)* | List of CIDR ranges. The edge's default-route uplink subnet inside these ranges is not migrated (no provider gateway subnet needed, no Tier-1 address). Kept automatically if NAT, IPsec or load balancer rules use its addresses. Omit to keep the original behaviour. |
 | `DmzStaticRoutes` *(v1.5.4+, optional)* | List of public CIDR blocks. Routed networks inside them get a static route on the provider Tier-0/VRF towards the tenant Tier-1 in the services phase; rollback removes them. The Tier-0 must redistribute static routes into BGP, and the routers' old static routes must be removed in the window. Omit to keep the original behaviour. |
+| `Tier1StaticRoutes` *(v1.5.8+, optional)* | `auto` and/or a list of `{network, nextHop, adminDistance, description}`. Org VDC level, overridable per edge under `EdgeGateways`. `auto` takes the routes recorded from the NSX-V edge whose next hop is on an Org VDC network, a segment backed uplink or a `ServiceUplinks` interface. A route is created only when its next hop is inside a network of the Tier-1; that network becomes its scope. Routes the upstream logic already created for the same destination are completed, not duplicated. Rollback removes the routes the tool created. |
+| `ServiceUplinks` *(v1.5.8+, optional, per edge only)* | Under `EdgeGateways: <edge>:`. `VlanTransportZone` (NSX-T VLAN transport zone of the customer edge cluster, required), `UplinkTeamingPolicy` (optional named teaming), `Uplinks`: `auto` (every interface of the edge unknown to VCD) or a list of `{portgroup, gateway, vlanId}`. `gateway` (an address in the interface subnet, e.g. the MPLS router) is taken from the static routes through the interface when omitted; `vlanId` is read from the portgroup when omitted. Needs the NSX-V Manager login (`NSXV` section). |
 | `MaxThreadCount` / `TimeoutForVappMigration` | Parallel vApp moves and per-vApp timeout (seconds). Size them to your vMotion bandwidth. |
 
 ---
@@ -217,6 +221,8 @@ Per organization VDC:
 
 **Without bridging**, VMs left in the source org VDC lose their gateway as soon as `services` runs. Plan `services` and `movevapp` for the same window, and move each org VDC completely.
 
+**Edges with static routes or interfaces added outside VCD (PATCH-14/15):** read the precheck log first. Every static route has a `PATCH-14:` line with its class and what will happen to it, and every interface unknown to VCD has a `PATCH-15:` line. For `ServiceUplinks` edges, the VLAN must be trunked to the NSX-T customer edge nodes before the window. The NSX-V interface is disconnected and the Tier-1 takes over its IPs during `services`, so run `services` in the window. After `services`, remove the router's old static routes for destinations that now come from the Tier-0 (`DmzStaticRoutes`).
+
 **Rollback** is supported until cleanup. Plan time for it in every window; VM traffic can be interrupted for some time during rollback (NSX-T known issue), and reconnecting VM NICs from the tenant portal restores it.
 
 ---
@@ -249,10 +255,11 @@ These come from upstream behavior and are **not** changed in v1.5.x:
 
 - **Legacy IP blocks need exact subnets.** On a provider gateway using legacy IP blocks, each source edge gateway subnet must exist on the provider gateway with the same network and prefix; overlapping subnet definitions cannot coexist. Provider gateways using **IP Spaces** accept larger internal scopes that contain the source subnets.
 - **Every external subnet needs a static pool.** VCD rejects external network subnets with an empty static IP pool.
-- **Static routes** whose next hop is reached through a Tier-0 connected uplink are reported as warnings and **not migrated**; configure them manually on the Tier-1 or Tier-0/VRF.
+- **Static routes** whose next hop is reached through a Tier-0 connected uplink are recorded and logged by precheck (PATCH-14) but **not migrated**; configure them manually on the Tier-1 or Tier-0/VRF.
 - **NAT rules with ranges** are only partly validated: the precheck catches ranges in DNAT translated addresses, but ranges in DNAT original addresses or SNAT addresses pass the precheck and fail during `services` (issue [#6](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/6)). Check NAT rules before the window.
 - **VCD 10.6** is not supported (issue [#21](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/21)).
 - **Rollback and vApp templates on the target.** Rollback deletes the target `-v2t` Org VDC networks as one of its last steps. vApp templates created or captured on the target after the migration, for example by the tenant, can still reference those networks, and rollback then stops at the network deletion. `--movecatalog` only moves catalogs it moved itself and does not change a template's network references. Before a rollback, check for templates on the target storage policy and agree with the tenant to download or delete them; then re-run `--rollback`.
+- **ServiceUplinks (PATCH-15)** support one subnet per interface and no dynamic routing on it: a BGP neighbour on the interface stops the precheck for that edge, because a Tier-1 cannot run BGP (that needs a dedicated Tier-0/VRF). Firewall rules that reference the NSX-V vNIC itself are not rebound. Cleanup keeps the created `<portgroup>-v2t` external network and segment, as they are in use.
 - `movevapp` moves all vApps of an org VDC; there is no per-vApp selection (feature request [#5](https://github.com/Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool/issues/5)).
 
 ---
@@ -264,12 +271,12 @@ These come from upstream behavior and are **not** changed in v1.5.x:
 Requirements: Python **3.8 or 3.9** x64 (PyInstaller 4.5.1 does not support newer versions), [Win64 OpenSSL Light](https://slproweb.com/products/Win32OpenSSL.html) installed in `C:\Program Files\OpenSSL-Win64`, internet access for pip.
 
 ```
-git clone -b release/v1.5.7 https://github.com/tylmz/NSX_V2T_Migration_Tool.git
+git clone -b release/v1.5.8 https://github.com/tylmz/NSX_V2T_Migration_Tool.git
 cd NSX_V2T_Migration_Tool
 build_windows.bat
 ```
 
-Or download the source zip of the `v1.5.7` release, extract it and run `build_windows.bat` from CMD. The script creates a virtual environment, installs the pinned dependencies, builds with PyInstaller, copies OpenSSL into the package and runs `--help`. The result is in `dist\vcdNSXMigrator\`.
+Or download the source zip of the `v1.5.8` release, extract it and run `build_windows.bat` from CMD. The script creates a virtual environment, installs the pinned dependencies, builds with PyInstaller, copies OpenSSL into the package and runs `--help`. The result is in `dist\vcdNSXMigrator\`.
 
 To build with Python 3.9 instead of 3.8, change `py -3.8` to `py -3.9` in `build_windows.bat`.
 
@@ -283,7 +290,7 @@ source venv/bin/activate
 pip install -r requirements_build.txt
 pip install -r src/requirements-windows.txt     # pycryptodome variant, works on Linux too
 python -m PyInstaller --noconfirm src/vcdNSXMigrator.spec
-tar -czf vcdNSXMigrator-v1.5.7-linux.tar.gz -C dist vcdNSXMigrator
+tar -czf vcdNSXMigrator-v1.5.8-linux.tar.gz -C dist vcdNSXMigrator
 ```
 
 `openssl` must be available on the PATH of the machine running the tool.

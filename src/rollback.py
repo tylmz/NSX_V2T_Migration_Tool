@@ -47,7 +47,10 @@ class Rollback:
             'vcdObj.setStaticRoutesScope(rollback=True)',
             'vcdObj.disconnectTargetOrgVDCNetwork(rollback=True)',
             'vcdObj.removeDmzStaticRoutes(nsxtObj)',  # PATCH-10
+            'vcdObj.removeTier1StaticRoutes()',  # PATCH-14
+            'vcdObj.detachServiceUplinks()',  # PATCH-15: the Tier-1 releases the IPs first
             'vcdObj.reconnectTargetEdgeGateway(reconnect=False)',
+            'vcdObj.reconnectServiceUplinkVnics()',  # PATCH-15: then the NSX-V vNICs get them back
             'vcdObj.reconnectOrDisconnectSourceEdgeGateway(sourceEdgeGatewayId, connect=True)',
             'vcdObj.connectUplinkSourceEdgeGateway(sourceEdgeGatewayId, rollback=True)',
             'vcdObj.disconnectSourceOrgVDCNetwork(orgVDCNetworkList, sourceEdgeGatewayId, rollback=True)',
@@ -76,6 +79,7 @@ class Rollback:
             'vcdObj.rollbackCatalogMoves()',
             'vcdObj.deleteOrgVDCNetworks(targetOrgVDCId, rollback=True)',
             'vcdObj.deleteNsxTBackedOrgVDCEdgeGateways(targetOrgVDCId)',
+            'vcdObj.deleteServiceUplinkNetworks(nsxtObj)',  # PATCH-15
             'vcdObj.releaseFloatingIps()',
             'vcdObj.releaseIpPrefixes()',
             'vcdObj.deleteIpPrefixAddedToIpSpaceUplinks()',

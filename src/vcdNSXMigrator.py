@@ -296,6 +296,55 @@ class VMwareCloudDirectorNSXMigrator():
         except:
             raise
 
+    @staticmethod
+    def _validateTier1StaticRoutes(value, key, errorInputDict):
+        """PATCH-14: 'auto' and/or a list of {network, nextHop, adminDistance (optional), description (optional)}."""
+        if value is None:
+            return
+        for item in (value if isinstance(value, list) else [value]):
+            if isinstance(item, str) and item.strip().lower() == 'auto':
+                continue
+            if not isinstance(item, dict):
+                errorInputDict[key] = "Entries must be 'auto' or {network, nextHop}"
+                return
+            try:
+                network = ipaddress.ip_network(str(item.get('network')).strip(), strict=False)
+                nextHop = ipaddress.ip_address(str(item.get('nextHop')).strip())
+                if network.version != nextHop.version:
+                    raise ValueError
+                if item.get('adminDistance') is not None and not 1 <= int(item['adminDistance']) <= 255:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errorInputDict[key] = "Invalid route {}".format(item)
+                return
+
+    @staticmethod
+    def _validateServiceUplinks(value, key, errorInputDict):
+        """PATCH-15: {VlanTransportZone, UplinkTeamingPolicy (optional), Uplinks: auto | [{portgroup, gateway, vlanId}]}."""
+        if value is None:
+            return
+        if not isinstance(value, dict) or not value.get('VlanTransportZone'):
+            errorInputDict[key] = "Must contain 'VlanTransportZone' (and optionally 'Uplinks', 'UplinkTeamingPolicy')"
+            return
+        uplinks = value.get('Uplinks', 'auto')
+        if uplinks == 'auto':
+            return
+        if not isinstance(uplinks, list):
+            errorInputDict[key] = "'Uplinks' must be 'auto' or a list"
+            return
+        for item in uplinks:
+            if not isinstance(item, dict) or not item.get('portgroup'):
+                errorInputDict[key] = "Each entry of 'Uplinks' needs 'portgroup'"
+                return
+            try:
+                if item.get('gateway'):
+                    ipaddress.ip_address(str(item['gateway']).strip())
+                if item.get('vlanId') is not None and not 1 <= int(item['vlanId']) <= 4094:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errorInputDict[key] = "Invalid entry {}".format(item)
+                return
+
     def inputValidation(self):
         """
         Description - Validation of user input values and convert nested user spec dict to simple dict
@@ -361,6 +410,16 @@ class VMwareCloudDirectorNSXMigrator():
                                     except ValueError:
                                         errorInputDict["{}['{}']".format(dictKey, listKey)] = \
                                             "Invalid CIDR '{}'".format(cidr)
+                            # PATCH-14/15: Tier1StaticRoutes (Org VDC and edge level), ServiceUplinks (edge level)
+                            self._validateTier1StaticRoutes(sourceOrgVdc.get('Tier1StaticRoutes'),
+                                                            "{}['Tier1StaticRoutes']".format(dictKey), errorInputDict)
+                            for edgeName, edgeValues in (sourceOrgVdc.get('EdgeGateways') or {}).items():
+                                edgeKey = "{}['EdgeGateways']['{}']".format(dictKey, edgeName)
+                                edgeValues = edgeValues or {}
+                                self._validateTier1StaticRoutes(edgeValues.get('Tier1StaticRoutes'),
+                                                                edgeKey + "['Tier1StaticRoutes']", errorInputDict)
+                                self._validateServiceUplinks(edgeValues.get('ServiceUplinks'),
+                                                             edgeKey + "['ServiceUplinks']", errorInputDict)
 
         if not isinstance(self.inputDict['VCloudDirector'].get('SourceOrgVDC'), list):
             errorInputDict["VCloudDirector['SourceOrgVDC']"] = 'Value should be list'
@@ -788,6 +847,10 @@ class VMwareCloudDirectorNSXMigrator():
                                       self.nsxvPassword, self.inputDict.get("NSXV", {})["Common"]["verify"])
         else:
             self.nsxvObj = NSXVOperations()
+
+        # PATCH-15: VCD objects use NSX-V Manager for edge interfaces added outside VCD (ServiceUplinks)
+        for vcdObj in self.vcdObjList:
+            vcdObj.nsxvObj = self.nsxvObj
 
         # initializing vcenter Api class
         self.vcenterObj = VcenterApi(self.inputDict["Vcenter"]["Common"]["ipAddress"], self.inputDict["Vcenter"]["Common"]["username"],

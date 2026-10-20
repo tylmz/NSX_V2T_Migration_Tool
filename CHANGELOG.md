@@ -4,6 +4,34 @@ Community builds of the NSX Migration for VMware Cloud Director tool, based on u
 `MT_v1.4.2.2.H001` (Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool). Details of every patch are in
 [PATCHES.md](PATCHES.md); every changed line in the source is marked with its `PATCH-n` comment.
 
+## v1.5.8 - 2026-10-20 (pre-release)
+
+Added
+- PATCH-14: static routes of the NSX-V edge.
+  - Precheck records every route in metadata, logs its class and the planned action, and no longer
+    fails on routes it cannot migrate.
+  - New optional `Tier1StaticRoutes` (`auto` and/or explicit routes, Org VDC level with per-edge
+    override): routes on the tenant Tier-1, scoped to the network that holds the next hop, created in
+    services before the vApps move; existing routes for the same destination are completed instead of
+    duplicated; rollback removes the routes the tool created.
+  - `DmzStaticRoutes` also creates Tier-0 routes for Tier-1 static-route destinations inside its blocks
+    (for example a public block a customer pfSense owns behind an internal interface).
+- PATCH-15: interfaces added to the NSX-V edge outside VCD (vCenter/NSX-V UI, for example MPLS or VPN
+  VLANs).
+  - Precheck detects and logs them for every edge.
+  - With the optional per-edge `ServiceUplinks`, the tool creates an NSX-T VLAN segment and a VCD
+    external network `<portgroup>-v2t` in topology, and in services disconnects the NSX-V interface,
+    attaches the external network to the Tier-1 as a service interface with the same IPs, keeps NAT
+    rules bound to it and adds NO_SNAT exceptions towards it. Rollback reverses all of it.
+  - Safety: nothing happens without `ServiceUplinks`; an existing segment or external network with
+    the target name that the tool did not create stops the precheck and is not touched; created
+    segments are tagged and rollback deletes only recorded, still-tagged objects; the NSX-V vNIC is
+    checked against the record before each change; the Tier-1 gets the IPs only after the NSX-V vNIC
+    is disconnected, and gives them back first on rollback.
+
+Changed
+- Release files now include the diff against the previous release instead of the diff against H001.
+
 ## v1.5.7 - 2026-10-19 (pre-release)
 
 Fixed
