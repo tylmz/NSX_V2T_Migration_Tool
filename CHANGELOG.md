@@ -4,6 +4,82 @@ Community builds of the NSX Migration for VMware Cloud Director tool, based on u
 `MT_v1.4.2.2.H001` (Calsoft-Pvt-Ltd/NSX_V2T_Migration_Tool). Details of every patch are in
 [PATCHES.md](PATCHES.md); every changed line in the source is marked with its `PATCH-n` comment.
 
+## v1.5.9 - 2026-10-21 (pre-release)
+
+Changed
+- NSX-V SNAT rules with an IP range as original address get the smallest network that covers the range;
+  a warning is logged when it is larger than the range. Earlier builds used a larger network (up to the
+  /24 of the range end), so tenants migrated with them can have broader SNAT sources (PATCH-17).
+
+Fixed (PATCH-17, code paths from the upstream base)
+- v2t assessment stopped on Org VDC names that were not found and dropped Org VDCs that vanished during the
+  run from the report; an empty result crashed the report.
+- Precheck assessment: a failed Org VDC network lookup crashed the error report; shared-network failures did
+  not count in the overall result; an empty result crashed it.
+- Route redistribution carried `TIER1_CONNECTED` over to later edge gateways (shared constant list).
+- DHCPv6 rollback enabled SLAAC instead of disabling it.
+- NAT payload creation failed on an edge without default gateway.
+- Catalog owner update and sharing treated HTTP 200 as failure.
+- Query API paging failed after the first page; the provider VDC lookup only searched the last page.
+- Security group validation errors were lost when a group was checked again.
+- NAT range conversion built lists of every address (very slow or out of memory for wide ranges).
+- QoS profiles sent the bandwidth as text in the deprecated field.
+- `movevapp`: a VM without a matching placement policy got the previous VM's policy.
+- NSX-V password prompt checked the NSX-T password; a wrong password did not reach the retry prompt; an
+  unexpected NSX-V login response counted as success.
+- Running without arguments or without `--filepath` crashed before printing help or a clear error.
+- Several error handlers failed themselves and hid the original error.
+
+## v1.5.8 - 2026-10-20 (pre-release)
+
+Added
+- PATCH-14: static routes of the NSX-V edge.
+  - Precheck records every route in metadata and logs its class and the planned action.
+  - New `Tier1StaticRoutes`, per edge gateway under `EdgeGateways`: the edge's static routes as an explicit
+    list of `{network, nextHop, adminDistance, description}`. Precheck compares it with the ESG: a route that
+    is not listed, a listed route the ESG does not have, a duplicate or a different `adminDistance` fails
+    the precheck. Auto-plumbed routes are not compared.
+  - The listed routes are created on the tenant Tier-1 in services, scoped to the network that holds the
+    next hop; existing routes for the same destination are completed instead of duplicated; rollback
+    removes the routes the tool created.
+  - `DmzStaticRoutes` also creates Tier-0 routes for Tier-1 static-route destinations inside its blocks (for
+    example a public block a customer pfSense owns behind an internal interface).
+- PATCH-15: interfaces added to the NSX-V edge outside VCD (vCenter/NSX-V UI, for example MPLS or VPN VLANs).
+  - Precheck detects and logs them for every edge.
+  - With the optional per-edge `ServiceUplinks`, the tool creates an NSX-T VLAN segment and a VCD external
+    network `<portgroup>-v2t` (exact portgroup name) in topology, and in services disconnects the NSX-V
+    interface, attaches the external network to the Tier-1 as a service interface with the same IPs, keeps
+    NAT rules bound to it and adds NO_SNAT exceptions towards it. Rollback reverses all of it.
+  - Every change is recorded before it is made and checked afterwards, so an interrupted run or rollback
+    continues from the live state; only objects the tool created are changed or deleted.
+
+Changed
+- Precheck: an edge gateway with static routes now needs `Tier1StaticRoutes` matching them (PATCH-14).
+- PATCH-11 `--movecatalog`: moved catalog items are recorded by their vApp template or media; rollback
+  moves back exactly those items and refuses move records without an item list.
+- Exit codes: 0 success, 1 failure, 130 aborted (PATCH-16).
+- Release files include the diff against the previous release instead of the diff against H001.
+
+Fixed (PATCH-16, code paths from the upstream base)
+- DHCP and IPsec rollback could wait forever for an NSX-V edge job; the wait now has a deadline.
+- Cleanup failed on uplink subnets without static pool (e.g. /30 uplinks with `EmptyIPPoolOverride`).
+- Firewall rules linked to SNAT rules got the NAT rule's interface as scope (wrong NAT type field); a
+  missing related rule reused the previous rule's data; NAT rules beyond the first 128 were not read.
+- DNAT-to-firewall matching for non-distributed networks matched address prefixes (192.168.1.1 matched
+  192.168.1.100) and failed on translated ranges.
+- NAT configuration and non-distributed routing stopped at the first edge gateway that needed no change,
+  skipping later edge gateways of the same Org VDC.
+- Locks could stay held after an early return or exception, blocking other threads.
+- Worker threads could crash on a queue race, and jobs were not always acknowledged.
+- NSX-T lists were read as one page only.
+- Concurrent certificate migrations shared fixed private-key file names; keys are no longer written to
+  files.
+- A failed certificate deletion left the tenant context header on later requests.
+- Metadata values were parsed with `eval`; rollback and cleanup tasks read from metadata were executed
+  without checking them.
+- Application port profiles could be reused without verifying their NSX-T Manager.
+- On Linux the password file was readable by others until it had been written.
+
 ## v1.5.7 - 2026-10-19 (pre-release)
 
 Fixed

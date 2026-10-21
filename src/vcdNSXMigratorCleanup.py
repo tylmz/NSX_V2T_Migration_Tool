@@ -22,6 +22,26 @@ sys.path.append(parentDir)
 from src import constants
 
 
+
+def buildEdgeGatewaySubnetDict(edgeGatewayDetails):
+    """
+    PATCH-16: {uplink subnet: [ip ranges]} of the source edge gateways, primary IPs included. An uplink subnet can
+    have no static pool ('ipRanges' or its 'values' null) - common for /30 uplinks with EmptyIPPoolOverride. The
+    ranges are copied, so the source edge gateway records are not changed.
+    """
+    edgeGatewaySubnetDict = {}
+    for edgeGateway in edgeGatewayDetails or []:
+        for edgeGatewayUplink in edgeGateway.get('edgeGatewayUplinks') or []:
+            for subnet in ((edgeGatewayUplink.get('subnets') or {}).get('values')) or []:
+                primaryIp = subnet.get('primaryIp')
+                networkAddress = ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']), strict=False)
+                ranges = list(((subnet.get('ipRanges') or {}).get('values')) or [])
+                # adding primary ip to sub allocated ip pool
+                if primaryIp and ipaddress.ip_address(primaryIp) in networkAddress:
+                    ranges.append({'startAddress': primaryIp, 'endAddress': primaryIp})
+                edgeGatewaySubnetDict.setdefault(networkAddress, []).extend(ranges)
+    return edgeGatewaySubnetDict
+
 class VMwareCloudDirectorNSXMigratorCleanup():
     """
     Description :   The class has methods which do all the clean-up tasks(like deleting, resetting, etc) after migrating the VMware vCloud Director from NSX-V to NSX-T
@@ -100,6 +120,9 @@ class VMwareCloudDirectorNSXMigratorCleanup():
             for validationTask in self.cleanupValidationTask:
                 # Performing cleanup validation task
                 self.consoleLogger.info(validationTask[0])
+                # PATCH-16: only the tool's own task expressions are executed
+                if validationTask[1] not in {task[1] for task in self.cleanupValidationTask}:
+                    raise Exception("Cleanup validation task '{}' is not a known task - not executed".format(validationTask[1]))
                 eval(validationTask[1])
             # Saving the cleanup validation tasks status in metadata
             self.vcdObj.createMetaDataInOrgVDC(
@@ -180,26 +203,7 @@ class VMwareCloudDirectorNSXMigratorCleanup():
         orgVDCNetworkList = self.vcdObj.getOrgVDCNetworks(self.targetOrgVDCId, 'targetOrgVDCNetworks', saveResponse=False, dfwStatus=dfwStatus)
 
         # getting the source external network details from source edge gateway and creating a dict of subnet and corresponding ip values used
-        edgeGatewaySubnetDict = {}
-        for edgeGateway in edgeGatewayDetails:
-            for edgeGatewayUplink in edgeGateway['edgeGatewayUplinks']:
-                for subnet in edgeGatewayUplink['subnets']['values']:
-                    # Getting value of primary ip
-                    primaryIp = subnet.get('primaryIp')
-                    # Creating ip range for primary ip
-                    subIpRange = [{'startAddress': primaryIp, 'endAddress': primaryIp}]
-
-                    networkAddress = ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']),
-                                                              strict=False)
-
-                    # adding primary ip to sub alloacated ip pool
-                    if primaryIp and ipaddress.ip_address(primaryIp) in networkAddress:
-                        subnet['ipRanges']['values'].extend(subIpRange)
-
-                    if networkAddress in edgeGatewaySubnetDict:
-                        edgeGatewaySubnetDict[networkAddress].extend(subnet['ipRanges']['values'])
-                    else:
-                        edgeGatewaySubnetDict[networkAddress] = subnet['ipRanges']['values']
+        edgeGatewaySubnetDict = buildEdgeGatewaySubnetDict(edgeGatewayDetails)  # PATCH-16
 
         try:
             # List of tasks to be performed as part of cleanup
@@ -217,6 +221,10 @@ class VMwareCloudDirectorNSXMigratorCleanup():
                 for cleanupTask in listOfCleanupTasks:
                     # Performing cleanup task
                     self.consoleLogger.info(cleanupTask[0])
+                    # PATCH-16: tasks resumed from metadata must be one of the tool's own task expressions
+                    if cleanupTask[1] not in {task[1] for task in self.cleanupTask}:
+                        raise Exception("Cleanup task '{}' from metadata is not a known cleanup task - not executed".format(
+                            cleanupTask[1]))
                     eval(cleanupTask[1])
                     # Removing task from cleanup tasks left list after the task has been performed successfully
                     cleanupTasksLeft.pop(0)

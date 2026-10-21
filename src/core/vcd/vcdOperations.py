@@ -17,6 +17,7 @@ import copy
 import sys
 import prettytable
 import requests
+import xmltodict  # PATCH-15
 import threading
 import traceback
 from collections import defaultdict
@@ -108,8 +109,19 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 logger.info("PATCH-10: {} advertises routed networks, no DMZ static routes needed".format(edgeName))
                 continue
             dmzNetworks = self.getDmzNetworks(edgeName, targetNetworks)
+            # PATCH-14 part 3: destinations of Tier-1 static routes inside DmzStaticRoutes get a Tier-0 route as well
+            blocks = self.dmzBlocks()
+            knownCidrs = {cidr for _, cidr in dmzNetworks}
+            for route in data.get('tier1StaticRoutes') or []:
+                if route.get('edge') != edgeName or route['network'] in knownCidrs:
+                    continue
+                routeNetwork = ipaddress.ip_network(route['network'], strict=False)
+                if any(routeNetwork.version == block.version and routeNetwork.subnet_of(block) for block in blocks):
+                    dmzNetworks.append(('static route via {}'.format(route['nextHop']), route['network']))
+                    knownCidrs.add(route['network'])
             if not dmzNetworks:
-                logger.info("PATCH-12: edge gateway {}: no routed network inside DmzStaticRoutes".format(edgeName))
+                logger.info("PATCH-12: edge gateway {}: no routed network or Tier-1 static route inside DmzStaticRoutes"
+                            .format(edgeName))
                 continue
             foundDmzNetwork = True
             externalNetwork = data['targetExternalNetwork'][edgeInput['Tier0Gateways']]
@@ -133,6 +145,17 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                     continue
                 routeUrl = "{}/infra/tier-0s/{}/static-routes/{}".format(
                     nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), tier0Id, routeId)
+                existingRoute = self._getDmzRoute(nsxtObj, routeUrl)
+                if existingRoute is not None:
+                    if not self._ownDmzRoute(existingRoute, targetEdgeGateway['id'], cidr):
+                        raise Exception("PATCH-10: Tier-0 static route {} exists and was not created by this tool for edge "
+                                        "{} - not touched".format(routeId, edgeName))
+                    created.append({'tier0': tier0Id, 'id': routeId, 'network': cidr,
+                                    'nextHop': (existingRoute.get('next_hops') or [{}])[0].get('ip_address'),
+                                    'edgeId': targetEdgeGateway['id']})
+                    data['dmzStaticRoutes'] = created
+                    self.saveMetadataInOrgVdc(force=True)
+                    continue
                 payload = {
                     "display_name": routeId,
                     "description": "V2T DMZ route for {} ({}) - edge {}".format(networkName, cidr, edgeName),
@@ -145,20 +168,35 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 if response.status_code not in (requests.codes.ok, requests.codes.created):
                     raise Exception("PATCH-10: failed to create Tier-0 static route {} via {}: {}".format(
                         cidr, nextHop, response.text[:200]))
-                created.append({'tier0': tier0Id, 'id': routeId, 'network': cidr, 'nextHop': nextHop})
+                created.append({'tier0': tier0Id, 'id': routeId, 'network': cidr, 'nextHop': nextHop,
+                                'edgeId': targetEdgeGateway['id']})
                 data['dmzStaticRoutes'] = created
                 self.saveMetadataInOrgVdc(force=True)
                 logger.info("PATCH-10: Tier-0 {} static route {} -> {} created for DMZ network {}".format(
                     tier0Id, cidr, nextHop, networkName))
         if not foundDmzNetwork:
             # PATCH-12: never skip silently when the user asked for DMZ routes
-            logger.warning("PATCH-12: DmzStaticRoutes is set but no routed Org VDC network inside it was found on the "
-                           "target edge gateways - no Tier-0 static routes created")
+            logger.warning("PATCH-12: DmzStaticRoutes is set but no routed Org VDC network or Tier-1 static route inside it "
+                           "was found on the target edge gateways - no Tier-0 static routes created")
             return
         logger.info("PATCH-10: remove the upstream routers' static routes for these DMZ subnets so the BGP routes are used")
 
+    @staticmethod
+    def _getDmzRoute(nsxtObj, routeUrl):
+        """PATCH-10: a Tier-0 static route; None only when NSX-T confirms it does not exist."""
+        response = nsxtObj.restClientObj.get(url=routeUrl, headers=nsxtConstants.NSXT_API_HEADER, auth=nsxtObj.restClientObj.auth)
+        if response.status_code == requests.codes.not_found:
+            return None
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-10: failed to read Tier-0 static route {} (HTTP {})".format(routeUrl, response.status_code))
+        return response.json()
+
+    @staticmethod
+    def _ownDmzRoute(route, edgeId, cidr):
+        return {'scope': 'v2t-dmz', 'tag': edgeId} in (route.get('tags') or []) and route.get('network') == cidr
+
     def removeDmzStaticRoutes(self, nsxtObj):
-        """PATCH-10: rollback of configureDmzStaticRoutes."""
+        """PATCH-10: rollback of configureDmzStaticRoutes; only routes tagged for the edge are deleted."""
         data = self.rollback.apiData
         routes = data.get('dmzStaticRoutes') or []
         if not routes:
@@ -168,19 +206,678 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         for route in routes:
             routeUrl = "{}/infra/tier-0s/{}/static-routes/{}".format(
                 nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress), route['tier0'], route['id'])
-            response = nsxtObj.restClientObj.delete(url=routeUrl, headers=nsxtConstants.NSXT_API_HEADER,
-                                                    auth=nsxtObj.restClientObj.auth)
-            if response.status_code in (requests.codes.ok, requests.codes.not_found):
+            try:
+                current = self._getDmzRoute(nsxtObj, routeUrl)
+                if current is None:
+                    continue
+                edgeId = route.get('edgeId') or next((tag.get('tag') for tag in current.get('tags') or []
+                                                      if tag.get('scope') == 'v2t-dmz'), None)
+                if not self._ownDmzRoute(current, edgeId, route['network']):
+                    raise Exception("route is not tagged as created by this tool")
+                response = nsxtObj.restClientObj.delete(url=routeUrl, headers=nsxtConstants.NSXT_API_HEADER,
+                                                        auth=nsxtObj.restClientObj.auth)
+                if response.status_code not in (requests.codes.ok, requests.codes.not_found):
+                    raise Exception("HTTP {}: {}".format(response.status_code, response.text[:200]))
+                if self._getDmzRoute(nsxtObj, routeUrl) is not None:
+                    raise Exception("still present after deletion")
                 logger.debug("PATCH-10: removed Tier-0 static route {}".format(route['id']))
-            else:
+            except Exception as err:
                 remaining.append(route)
-                logger.error("PATCH-10: failed to remove Tier-0 static route {}: {}".format(route['id'], response.text[:200]))
+                logger.error("PATCH-10: Tier-0 static route {} not removed: {}".format(route['id'], err))
         data['dmzStaticRoutes'] = remaining
         self.saveMetadataInOrgVdc(force=True)
         if remaining:
             raise Exception("PATCH-10: some DMZ static routes could not be removed: {}".format(
                 ', '.join(route['id'] for route in remaining)))
         logger.info("RollBack: restore the upstream routers' static routes for the DMZ subnets towards the NSX-V edge")
+    # ------------------------------------------------------------------------------------------------------
+
+    # PATCH-14 part 2: static routes on the tenant Tier-1 ------------------------------------------------
+    # Opt-in through 'Tier1StaticRoutes' under EdgeGateways: the edge's static routes, listed explicitly. Precheck
+    # (PATCH-14 part 1) requires the list to match the NSX-V edge exactly. A route is created
+    # only when its next hop lies in a network of the Tier-1 (routed Org VDC network, segment backed uplink or
+    # PATCH-15 service uplink); that network becomes its scope. Routes that already exist for the same
+    # destination are completed (next hop, scope, admin distance) instead of duplicated. Every write is read
+    # back. A route is recorded as 'creating' before it is created, so an interrupted run still knows it owns
+    # it; rollback removes the routes it created and keeps the record until their absence is confirmed.
+
+    MODE_RANK = {'adopted': 0, 'updated': 1, 'creating': 2, 'created': 2}
+
+    def _listCloudApiValues(self, url, missingOk=False):
+        """PATCH-14: all pages of a cloudapi list; None for 404 when missingOk."""
+        values, page = [], 1
+        separator = '&' if '?' in url else '?'
+        while True:
+            response = self.restClientObj.get('{}{}page={}&pageSize=128'.format(url, separator, page), self._cloudApiHeaders())
+            if response.status_code == requests.codes.not_found and missingOk:
+                return None
+            if response.status_code != requests.codes.ok:
+                raise Exception("PATCH-14: failed to read {} (HTTP {})".format(url, response.status_code))
+            body = response.json() or {}
+            values.extend(body.get('values') or [])
+            if page >= int(body.get('pageCount') or 1):
+                return values
+            page += 1
+
+    def _tier1Routes(self, edgeId, missingOk=False):
+        url = "{}{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                              vcdConstants.TARGET_STATIC_ROUTE.format(edgeId))
+        return self._listCloudApiValues(url, missingOk=missingOk)
+
+    def _tier1Scopes(self, edgeGatewayName, targetNetworks):
+        """PATCH-14: [(ip_network, {'name', 'id'})] of the networks attached to a target Tier-1."""
+        data = self.rollback.apiData
+        scopes = []
+        for network in targetNetworks:
+            if ((network.get('connection') or {}).get('routerRef') or {}).get('name') != edgeGatewayName:
+                continue
+            for subnet in (network.get('subnets') or {}).get('values') or []:
+                try:
+                    scopes.append((ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']), strict=False),
+                                   {'name': network['name'], 'id': network['id']}))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        for uplinkName, subnets in ((data.get('isT1Connected') or {}).get(edgeGatewayName) or {}).items():
+            extNetId = (data.get('segmentToIdMapping') or {}).get(uplinkName + '-v2t')
+            for item in subnets or []:
+                try:
+                    scopes.append((ipaddress.ip_network('{}/{}'.format(item[0], item[1]), strict=False),
+                                   {'name': uplinkName + '-v2t', 'id': extNetId}))
+                except (IndexError, TypeError, ValueError):
+                    continue
+        for plan in (data.get('serviceUplinks') or {}).get(edgeGatewayName) or []:
+            if plan.get('extNetId') and plan.get('attached'):
+                scopes.append((ipaddress.ip_network(plan['network'], strict=False), {'name': plan['name'], 'id': plan['extNetId']}))
+        return [scope for scope in scopes if scope[1].get('id')]
+
+    def _wantedTier1Routes(self, edgeGatewayName):
+        """PATCH-14: the 'Tier1StaticRoutes' entries of one edge (validated against the NSX-V edge in precheck);
+        an entry without 'adminDistance' takes the ESG route's distance."""
+        recorded = {self._routeKey(route['network'], route['nextHop']): route
+                    for route in (self.rollback.apiData.get('esgStaticRoutes') or {}).get(edgeGatewayName) or []}
+        wanted = []
+        for item in self.tier1RoutesInput(edgeGatewayName) or []:
+            network, nextHop = self._routeKey(item['network'], item['nextHop'])
+            esgRoute = recorded.get((network, nextHop)) or {}
+            distance = item.get('adminDistance') if item.get('adminDistance') is not None else esgRoute.get('adminDistance')
+            wanted.append({'network': network, 'nextHop': nextHop, 'adminDistance': int(distance or 1),
+                           'description': item.get('description') or esgRoute.get('description') or 'Tier1StaticRoutes'})
+        return wanted
+
+    def _recordTier1Route(self, recorded, entry):
+        previous = next((item for item in recorded if item['edgeId'] == entry['edgeId'] and item['network'] == entry['network']
+                         and item['nextHop'] == entry['nextHop']), None)
+        if previous and self.MODE_RANK.get(previous['mode'], 0) > self.MODE_RANK.get(entry['mode'], 0):
+            # keep how the route got there (an interrupted or repeated run must not downgrade ownership)
+            entry['mode'] = 'created' if previous['mode'] in ('created', 'creating') and entry['mode'] != 'creating' else previous['mode']
+        recorded[:] = [item for item in recorded if item is not previous] + [entry]
+        self.rollback.apiData['tier1StaticRoutes'] = recorded
+        self.saveMetadataInOrgVdc(force=True)
+
+    @staticmethod
+    def _hopMatches(hop, nextHop, scopeId, adminDistance):
+        return bool(hop) and hop.get('ipAddress') == nextHop and ((hop.get('scope') or {}).get('id')) == scopeId \
+            and int(hop.get('adminDistance') or 1) == int(adminDistance)
+
+    @isSessionExpired
+    def configureTier1StaticRoutes(self):
+        """PATCH-14 part 2: creates the static routes of 'Tier1StaticRoutes' on the tenant Tier-1s."""
+        if float(self.version) < float(vcdConstants.API_VERSION_BETELGEUSE_10_4):
+            return
+        data = self.rollback.apiData
+        edges = [edge for edge in data.get('targetEdgeGateway', []) if self.tier1RoutesInput(edge['name'])]
+        if not edges:
+            return
+        targetNetworks = self.getOrgVDCNetworks(data['targetOrgVDC']['@id'], 'targetOrgVDCNetworks', saveResponse=False)
+        recorded = data.get('tier1StaticRoutes') or []
+        headers = self._cloudApiHeaders()
+        for targetEdgeGateway in edges:
+            edgeName, edgeId = targetEdgeGateway['name'], targetEdgeGateway['id']
+            wanted = self._wantedTier1Routes(edgeName)
+            scopes = self._tier1Scopes(edgeName, targetNetworks)
+            for route in wanted:
+                nextHop = ipaddress.ip_address(route['nextHop'])
+                scope = next((item[1] for item in scopes if nextHop.version == item[0].version and nextHop in item[0]), None)
+                if not scope:
+                    logger.warning("PATCH-14: edge gateway {}: route {} via {} not created - the next hop is in no network "
+                                   "of the Tier-1".format(edgeName, route['network'], route['nextHop']))
+                    continue
+                hop = {'ipAddress': route['nextHop'], 'adminDistance': route['adminDistance'],
+                       'scope': {'name': scope['name'], 'id': scope['id'], 'scopeType': 'NETWORK'}}
+                entry = {'edgeId': edgeId, 'edge': edgeName, 'network': route['network'], 'nextHop': route['nextHop'],
+                         'scope': scope['name']}
+                existing = next((item for item in self._tier1Routes(edgeId) if item.get('networkCidr') == route['network']), None)
+                if existing:
+                    current = next((h for h in existing.get('nextHops') or [] if h.get('ipAddress') == route['nextHop']), None)
+                    if self._hopMatches(current, route['nextHop'], scope['id'], route['adminDistance']):
+                        mode = 'adopted'
+                    else:
+                        payload = {'name': existing.get('name'), 'description': existing.get('description'),
+                                   'networkCidr': existing['networkCidr'],
+                                   'nextHops': [h for h in existing.get('nextHops') or [] if h.get('ipAddress') != route['nextHop']] + [hop]}
+                        url = "{}{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                                              vcdConstants.TARGET_STATIC_ROUTE_BY_ID.format(edgeId, existing['id']))
+                        response = self.restClientObj.put(url, headers, data=json.dumps(payload))
+                        if response.status_code != requests.codes.accepted:
+                            raise Exception("PATCH-14: failed to update static route {} on edge gateway {}: {}".format(
+                                route['network'], edgeName, response.text[:200]))
+                        self._checkTaskStatus(taskUrl=response.headers['Location'])
+                        mode = 'updated'
+                    entry.update({'routeId': existing['id'], 'mode': mode})
+                else:
+                    entry.update({'routeId': None, 'mode': 'creating'})
+                    self._recordTier1Route(recorded, dict(entry))
+                    payload = {'name': 'v2t-' + route['network'].replace('/', '_'), 'description': route['description'],
+                               'networkCidr': route['network'], 'nextHops': [hop]}
+                    url = "{}{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                                          vcdConstants.TARGET_STATIC_ROUTE.format(edgeId))
+                    response = self.restClientObj.post(url, headers, data=json.dumps(payload))
+                    if response.status_code != requests.codes.accepted:
+                        raise Exception("PATCH-14: failed to create static route {} on edge gateway {}: {}".format(
+                            route['network'], edgeName, response.text[:200]))
+                    self._checkTaskStatus(taskUrl=response.headers['Location'])
+                    entry['mode'] = 'created'
+                # read back: the route must now carry exactly this next hop
+                current = next((item for item in self._tier1Routes(edgeId) if item.get('networkCidr') == route['network']), None)
+                if not current or not self._hopMatches(next((h for h in current.get('nextHops') or []
+                                                             if h.get('ipAddress') == route['nextHop']), None),
+                                                       route['nextHop'], scope['id'], route['adminDistance']):
+                    raise Exception("PATCH-14: static route {} via {} on edge gateway {} is not as configured after the "
+                                    "update".format(route['network'], route['nextHop'], edgeName))
+                entry['routeId'] = current['id']
+                self._recordTier1Route(recorded, entry)
+                logger.info("PATCH-14: edge gateway {}: Tier-1 route {} -> {} (scope {}, distance {}) {}".format(
+                    edgeName, route['network'], route['nextHop'], scope['name'], route['adminDistance'], entry['mode']))
+
+    @isSessionExpired
+    def removeTier1StaticRoutes(self):
+        """PATCH-14 part 2 rollback: deletes the Tier-1 static routes this tool created (adopted ones stay)."""
+        data = self.rollback.apiData
+        recorded = data.get('tier1StaticRoutes') or []
+        if not recorded:
+            return
+        headers = self._cloudApiHeaders()
+        remaining = []
+        for route in recorded:
+            if route.get('mode') not in ('created', 'creating'):
+                continue
+            routes = self._tier1Routes(route['edgeId'], missingOk=True)
+            if routes is None:
+                continue  # edge gateway is gone, and its routes with it
+            current = next((item for item in routes if (route.get('routeId') and item.get('id') == route['routeId']) or
+                            (not route.get('routeId') and item.get('networkCidr') == route['network'])), None)
+            if not current:
+                continue  # confirmed absent
+            url = "{}{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                                  vcdConstants.TARGET_STATIC_ROUTE_BY_ID.format(route['edgeId'], current['id']))
+            response = self.restClientObj.delete(url, headers)
+            if response.status_code == requests.codes.accepted:
+                self._checkTaskStatus(taskUrl=response.headers['Location'])
+            elif response.status_code != requests.codes.not_found:
+                remaining.append(route)
+                logger.error("PATCH-14: failed to remove Tier-1 route {} (HTTP {}): {}".format(
+                    route['network'], response.status_code, response.text[:200]))
+                continue
+            routes = self._tier1Routes(route['edgeId'], missingOk=True)
+            if routes and any(item.get('id') == current['id'] for item in routes):
+                remaining.append(route)
+                logger.error("PATCH-14: Tier-1 route {} still present after deletion".format(route['network']))
+        data['tier1StaticRoutes'] = remaining
+        self.saveMetadataInOrgVdc(force=True)
+        if remaining:
+            raise Exception("PATCH-14: some Tier-1 static routes could not be removed: {}".format(
+                ', '.join(route['network'] for route in remaining)))
+
+    # PATCH-15: service uplinks for interfaces VCD does not know ------------------------------------------
+    # topology : createServiceUplinkNetworks - NSX-T VLAN segment + segment backed VCD external network
+    # services : disconnectServiceUplinkVnics - the NSX-V vNIC is disconnected (verified against the record)
+    #            attachServiceUplinks         - the external network is attached to the Tier-1 (same IPs)
+    #            configureServiceUplinkNoSnat - NO_SNAT exceptions so traffic towards the uplink is not translated
+    #                                           by SNAT rules that were bound to another vNIC on NSX-V
+    # rollback : detachServiceUplinks, reconnectServiceUplinkVnics, deleteServiceUplinkNetworks
+    # Every change is recorded in metadata before it is made and checked against the live object afterwards;
+    # after an interruption the record is reconciled with the live state. Only objects recorded as created
+    # by this tool are changed or deleted, and ownership is only cleared once their absence is confirmed.
+
+    def _cloudApiHeaders(self):
+        return {'Authorization': self.headers['Authorization'],
+                'Accept': vcdConstants.OPEN_API_CONTENT_TYPE.format(self.version),
+                'Content-Type': 'application/json'}
+
+    def _serviceUplinkTags(self, plan):
+        sourceOrgVdcUuid = self.rollback.apiData['sourceOrgVDC']['@id'].split(':')[-1]
+        return [{'scope': self.SERVICE_UPLINK_TAG_SCOPE, 'tag': self.SERVICE_UPLINK_TAG},
+                {'scope': self.SERVICE_UPLINK_ORG_SCOPE, 'tag': sourceOrgVdcUuid},
+                {'scope': self.SERVICE_UPLINK_PORTGROUP_SCOPE, 'tag': plan['portgroupId']}]
+
+    def _getExternalNetworkByName(self, name):
+        return self.findExternalNetworkByName(name)
+
+    def _getExternalNetworkById(self, extNetId):
+        """PATCH-15: external network by id; None only when VCD confirms it does not exist."""
+        url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EXTERNAL_NETWORKS, extNetId)
+        response = self.restClientObj.get(url, headers=self._cloudApiHeaders())
+        if response.status_code == requests.codes.not_found:
+            return None
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-15: failed to read external network {} (HTTP {})".format(extNetId, response.status_code))
+        return response.json()
+
+    def _ownExternalNetwork(self, extNet, plan):
+        """PATCH-15: True when an external network is the one this tool creates for the plan (name, backing, subnet)."""
+        backings = [backing.get('backingId') for backing in (extNet.get('networkBackings') or {}).get('values') or []]
+        subnets = (extNet.get('subnets') or {}).get('values') or []
+        return extNet.get('name') == plan['name'] and plan.get('segmentUniqueId') in backings and any(
+            subnet.get('gateway') == plan['gateway'] for subnet in subnets)
+
+    def _getSegment(self, nsxtObj, segmentId):
+        """PATCH-15: NSX-T segment by id; None only when NSX-T confirms it does not exist."""
+        url = nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress) + nsxtConstants.LOGICAL_SEGMENTS_ENDPOINT.format(segmentId)
+        response = nsxtObj.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=nsxtObj.restClientObj.auth)
+        if response.status_code == requests.codes.not_found:
+            return None
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-15: failed to read NSX-T segment {} (HTTP {})".format(segmentId, response.status_code))
+        return response.json()
+
+    @isSessionExpired
+    def createServiceUplinkNetworks(self, nsxtObj):
+        """PATCH-15 (topology): NSX-T VLAN segment and VCD external network '<portgroup>-v2t' per planned uplink."""
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        plans = data.get('serviceUplinks') or {}
+        if not any(plans.values()):
+            return
+        sourceOrgVdcUuid = data['sourceOrgVDC']['@id'].split(':')[-1]
+        for edgeName, edgePlans in plans.items():
+            t0Gateway = self.orgVdcInput['EdgeGateways'][edgeName]['Tier0Gateways']
+            provider = (((data.get('targetExternalNetwork') or {}).get(t0Gateway) or {}).get('networkBackings') or {}) \
+                .get('values', [{}])[0].get('networkProvider')
+            if not provider:
+                raise Exception("PATCH-15: NSX-T manager of provider gateway {} not found".format(t0Gateway))
+            for plan in edgePlans:
+                created = plan.setdefault('created', {})
+                segmentId = plan['segmentId']
+                intentPath = nsxtConstants.LOGICAL_SEGMENTS_ENDPOINT.format(segmentId)
+                url = nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress) + intentPath
+                segment = self._getSegment(nsxtObj, segmentId)
+                if segment is not None:
+                    if not self.ownedServiceUplinkSegment(segment, sourceOrgVdcUuid, plan):
+                        raise Exception("PATCH-15: NSX-T segment {} exists and was not created by this tool for this "
+                                        "portgroup and VLAN - not touched".format(segmentId))
+                else:
+                    payload = {'id': segmentId, 'display_name': plan['name'],
+                               'description': 'NSX V2T migration: service uplink of edge {} (portgroup {})'.format(
+                                   edgeName, plan['portgroupName']),
+                               'transport_zone_path': plan['transportZonePath'], 'vlan_ids': [str(plan['vlanId'])],
+                               'tags': self._serviceUplinkTags(plan)}
+                    if plan.get('teamingPolicy'):
+                        payload['advanced_config'] = {'uplink_teaming_policy_name': plan['teamingPolicy']}
+                    created['segment'] = True  # recorded first: the tagged segment is recognised as ours on a re-run
+                    self.saveMetadataInOrgVdc(force=True)
+                    response = nsxtObj.restClientObj.put(url=url, headers=nsxtConstants.NSXT_API_HEADER,
+                                                         auth=nsxtObj.restClientObj.auth, data=json.dumps(payload))
+                    if response.status_code not in (requests.codes.ok, requests.codes.created):
+                        raise Exception("PATCH-15: failed to create NSX-T segment {}: {}".format(segmentId, response.text[:300]))
+                    nsxtObj.checkRealizedState(intentPath)
+                    logger.info("PATCH-15: NSX-T VLAN segment {} (VLAN {}) created".format(plan['name'], plan['vlanId']))
+                    segment = self._getSegment(nsxtObj, segmentId)
+                created['segment'] = True
+                uniqueId = (segment or {}).get('unique_id')
+                if not uniqueId:
+                    raise Exception("PATCH-15: NSX-T segment {} has no realized id yet".format(segmentId))
+                plan['segmentPath'] = intentPath
+                plan['segmentUniqueId'] = uniqueId
+
+                existing = self._getExternalNetworkByName(plan['name'])
+                if existing:
+                    ours = existing.get('id') == plan.get('extNetId') or (plan.get('extNetPending') and self._ownExternalNetwork(existing, plan))
+                    if not ours:
+                        raise Exception("PATCH-15: VCD external network {} exists and was not created by this tool - not touched"
+                                        .format(plan['name']))
+                    created['extNet'] = True
+                else:
+                    payload = {
+                        'name': plan['name'],
+                        'description': 'NSX V2T migration: service uplink of edge {} (Org VDC {})'.format(
+                            edgeName, data['sourceOrgVDC']['@name']),
+                        'networkBackings': {'values': [{'backingId': uniqueId,
+                                                        'backingTypeValue': 'IMPORTED_T_LOGICAL_SWITCH',
+                                                        'networkProvider': {'name': provider.get('name'), 'id': provider.get('id')}}]},
+                        'subnets': {'values': [{
+                            'gateway': plan['gateway'],
+                            'prefixLength': ipaddress.ip_network(plan['network']).prefixlen,
+                            'enabled': True,
+                            'ipRanges': {'values': [{'startAddress': ip, 'endAddress': ip} for ip in plan['ips']]}}]}}
+                    plan['extNetPending'] = True  # recorded first: an interrupted creation is recognised on a re-run
+                    self.saveMetadataInOrgVdc(force=True)
+                    url = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EXTERNAL_NETWORKS)
+                    response = self.restClientObj.post(url, self._cloudApiHeaders(), data=json.dumps(payload))
+                    if response.status_code != requests.codes.accepted:
+                        raise Exception("PATCH-15: failed to create VCD external network {}: {}".format(
+                            plan['name'], response.text[:300]))
+                    self._checkTaskStatus(taskUrl=response.headers['Location'])
+                    existing = self._getExternalNetworkByName(plan['name'])
+                    if not existing or not self._ownExternalNetwork(existing, plan):
+                        raise Exception("PATCH-15: VCD external network {} not found as created".format(plan['name']))
+                    created['extNet'] = True
+                    logger.info("PATCH-15: VCD external network {} created on segment {}".format(plan['name'], segmentId))
+                plan['extNetId'] = existing['id']
+                plan['extNetPending'] = False
+                data['serviceUplinks'] = plans
+                self.saveMetadataInOrgVdc(force=True)
+
+    def _nsxvVnicChecked(self, plan):
+        """PATCH-15: the live NSX-V vNIC of a plan, after checking it is still the recorded interface."""
+        nsxvObj = getattr(self, 'nsxvObj', None)
+        if not getattr(nsxvObj, 'restClientObj', None):
+            raise Exception("PATCH-15: NSX-V Manager login is required to change vNIC {} of edge {}".format(
+                plan['vnicIndex'], plan['nsxvEdgeId']))
+        vnic = (self.nsxvVnic(nsxvObj, plan['nsxvEdgeId'], plan['vnicIndex']) or {}).get('vnic') or {}
+        if vnic.get('portgroupId') != plan['portgroupId']:
+            raise Exception("PATCH-15: vNIC {} of NSX-V edge {} is now on portgroup {} (recorded {}) - not changed".format(
+                plan['vnicIndex'], plan['nsxvEdgeId'], vnic.get('portgroupId'), plan['portgroupId']))
+        primaries = [group.get('primaryAddress') for group in listify((vnic.get('addressGroups') or {}).get('addressGroup')) if group]
+        if plan['primary'] not in primaries:
+            raise Exception("PATCH-15: vNIC {} of NSX-V edge {} no longer has address {} - not changed".format(
+                plan['vnicIndex'], plan['nsxvEdgeId'], plan['primary']))
+        return vnic
+
+    @staticmethod
+    def _vnicConnected(vnic):
+        return str(vnic.get('isConnected')).lower() == 'true'
+
+    def _putNsxvVnicConnected(self, plan, vnic, connected):
+        """PATCH-15: sets isConnected of a checked vNIC and confirms the result by reading it back."""
+        nsxvObj = self.nsxvObj
+        vnic = dict(vnic)
+        vnic['isConnected'] = 'true' if connected else 'false'
+        restClient = nsxvObj.restClientObj
+        url = "https://{}/api/4.0/edges/{}/vnics/{}".format(nsxvObj.ipAddress, plan['nsxvEdgeId'], plan['vnicIndex'])
+        response = restClient.put(url, headers={'Content-Type': 'application/xml'}, auth=restClient.auth,
+                                  data=xmltodict.unparse({'vnic': vnic}))
+        if response.status_code not in (requests.codes.ok, requests.codes.no_content):
+            raise Exception("PATCH-15: failed to {} vNIC {} of NSX-V edge {}: {}".format(
+                'connect' if connected else 'disconnect', plan['vnicIndex'], plan['nsxvEdgeId'], response.text[:300]))
+        if self._vnicConnected(self._nsxvVnicChecked(plan)) != connected:
+            raise Exception("PATCH-15: vNIC {} of NSX-V edge {} did not change state".format(plan['vnicIndex'], plan['nsxvEdgeId']))
+
+    def disconnectServiceUplinkVnics(self):
+        """
+        PATCH-15 (services): disconnects the NSX-V vNICs that move to Tier-1 service interfaces. The original state
+        is recorded before the change; an interrupted run is completed from the live state.
+        """
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        for edgeName, edgePlans in (data.get('serviceUplinks') or {}).items():
+            for plan in edgePlans:
+                if not plan.get('extNetId') or plan.get('vnicState') == 'disconnected':
+                    continue
+                vnic = self._nsxvVnicChecked(plan)
+                if plan.get('vnicState') == 'unknown':
+                    if not self._vnicConnected(vnic):
+                        raise Exception("PATCH-15: edge gateway {}: the record of vNIC {} (earlier record format) does not show "
+                                        "whether the tool disconnected it, and it is disconnected now. Check its original state; "
+                                        "if it was connected, connect it in NSX-V and run again".format(edgeName, plan['vnicIndex']))
+                    plan['vnicOriginal'] = 'true'
+                if plan.get('vnicOriginal') is None:
+                    plan['vnicOriginal'] = 'true' if self._vnicConnected(vnic) else 'false'
+                plan['vnicState'] = 'disconnecting'
+                self.saveMetadataInOrgVdc(force=True)
+                if self._vnicConnected(vnic):
+                    self._putNsxvVnicConnected(plan, vnic, connected=False)
+                plan['vnicState'] = 'disconnected'
+                self.saveMetadataInOrgVdc(force=True)
+                logger.info("PATCH-15: edge gateway {}: NSX-V vNIC {} ({}) disconnected (originally {})".format(
+                    edgeName, plan['vnicIndex'], plan['portgroupName'],
+                    'connected' if plan['vnicOriginal'] == 'true' else 'disconnected'))
+
+    def reconnectServiceUplinkVnics(self):
+        """
+        PATCH-15 rollback: restores the recorded original state of the NSX-V vNICs, only after the Tier-1 has
+        released their IPs.
+        """
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        for edgeName, edgePlans in (data.get('serviceUplinks') or {}).items():
+            for plan in edgePlans:
+                if plan.get('vnicState') == 'unknown':
+                    if self._serviceUplinkOnTier1(edgeName, plan):
+                        raise Exception("PATCH-15: edge gateway {}: {} is still attached to the Tier-1 - the NSX-V vNIC is not "
+                                        "reconnected".format(edgeName, plan['name']))
+                    if not self._vnicConnected(self._nsxvVnicChecked(plan)):
+                        raise Exception("PATCH-15: edge gateway {}: the record of vNIC {} (earlier record format) does not show "
+                                        "whether the tool disconnected it - check and restore its state in NSX-V, then run the "
+                                        "rollback again".format(edgeName, plan['vnicIndex']))
+                    plan['vnicState'] = 'restored'
+                    self.saveMetadataInOrgVdc(force=True)
+                    continue
+                if plan.get('vnicState') not in ('disconnecting', 'disconnected', 'reconnecting'):
+                    continue
+                if self._serviceUplinkOnTier1(edgeName, plan):
+                    raise Exception("PATCH-15: edge gateway {}: {} is still attached to the Tier-1 - the NSX-V vNIC is not "
+                                    "reconnected".format(edgeName, plan['name']))
+                vnic = self._nsxvVnicChecked(plan)
+                plan['vnicState'] = 'reconnecting'
+                self.saveMetadataInOrgVdc(force=True)
+                if plan.get('vnicOriginal') == 'true' and not self._vnicConnected(vnic):
+                    self._putNsxvVnicConnected(plan, vnic, connected=True)
+                    logger.info("RollBack: PATCH-15: edge gateway {}: NSX-V vNIC {} ({}) reconnected".format(
+                        edgeName, plan['vnicIndex'], plan['portgroupName']))
+                plan['vnicState'] = 'restored'
+                self.saveMetadataInOrgVdc(force=True)
+
+    def _readTargetEdge(self, targetEdgeGateway):
+        """PATCH-15: current target edge gateway JSON; None only when VCD confirms it does not exist."""
+        url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                               targetEdgeGateway['id'])
+        response = self.restClientObj.get(url, self._cloudApiHeaders())
+        if response.status_code == requests.codes.not_found:
+            return None
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-15: failed to read edge gateway {} (HTTP {})".format(
+                targetEdgeGateway['name'], response.status_code))
+        return response.json()
+
+    def _serviceUplinkOnTier1(self, edgeGatewayName, plan):
+        targetEdge = next((edge for edge in self.rollback.apiData.get('targetEdgeGateway', []) if edge['name'] == edgeGatewayName), None)
+        if not targetEdge or not plan.get('extNetId'):
+            return False
+        current = self._readTargetEdge(targetEdge)
+        return bool(current) and any(uplink.get('uplinkId') == plan['extNetId'] for uplink in current.get('edgeGatewayUplinks') or [])
+
+    def _updateTargetEdgeUplinks(self, targetEdgeGateway, addPlans=None, removeIds=None):
+        """PATCH-15: adds/removes uplinks on the freshly read edge gateway. Returns 'absent', 'unchanged' or 'updated'."""
+        payload = self._readTargetEdge(targetEdgeGateway)
+        if payload is None:
+            return 'absent'
+        payload.pop('status', None)
+        uplinks = payload.get('edgeGatewayUplinks') or []
+        newUplinks = [uplink for uplink in uplinks if uplink.get('uplinkId') not in (removeIds or [])]
+        for plan in addPlans or []:
+            if any(uplink.get('uplinkId') == plan['extNetId'] for uplink in newUplinks):
+                continue
+            newUplinks.append({'uplinkId': plan['extNetId'], 'uplinkName': plan['name'], 'connected': True, 'dedicated': False,
+                               'subnets': {'values': [{
+                                   'gateway': plan['gateway'],
+                                   'prefixLength': ipaddress.ip_network(plan['network']).prefixlen,
+                                   'enabled': True, 'primaryIp': plan['primary'],
+                                   'ipRanges': {'values': [{'startAddress': ip, 'endAddress': ip} for ip in plan['ips']]}}]}})
+        if [uplink.get('uplinkId') for uplink in newUplinks] == [uplink.get('uplinkId') for uplink in uplinks]:
+            return 'unchanged'
+        payload['edgeGatewayUplinks'] = newUplinks
+        url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                               targetEdgeGateway['id'])
+        response = self.restClientObj.put(url, self._cloudApiHeaders(), data=json.dumps(payload))
+        if response.status_code != requests.codes.accepted:
+            raise Exception("PATCH-15: failed to update uplinks of edge gateway {}: {}".format(
+                targetEdgeGateway['name'], response.text[:300]))
+        self._checkTaskStatus(taskUrl=response.headers['Location'])
+        return 'updated'
+
+    @isSessionExpired
+    def attachServiceUplinks(self):
+        """PATCH-15 (services): attaches the '<portgroup>-v2t' external networks to the Tier-1s (service interfaces)."""
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        plans = data.get('serviceUplinks') or {}
+        for targetEdgeGateway in data.get('targetEdgeGateway', []):
+            edgePlans = [plan for plan in plans.get(targetEdgeGateway['name']) or [] if plan.get('extNetId')]
+            if not edgePlans:
+                continue
+            for plan in edgePlans:
+                # the IPs move only when the NSX-V vNIC is recorded and confirmed disconnected
+                if plan.get('vnicState') != 'disconnected' or self._vnicConnected(self._nsxvVnicChecked(plan)):
+                    raise Exception("PATCH-15: edge gateway {}: NSX-V vNIC {} is not disconnected - not attaching the same "
+                                    "IPs to the Tier-1".format(targetEdgeGateway['name'], plan['vnicIndex']))
+            if self._updateTargetEdgeUplinks(targetEdgeGateway, addPlans=edgePlans) == 'absent':
+                raise Exception("PATCH-15: target edge gateway {} not found".format(targetEdgeGateway['name']))
+            current = self._readTargetEdge(targetEdgeGateway) or {}
+            for plan in edgePlans:
+                uplink = next((u for u in current.get('edgeGatewayUplinks') or [] if u.get('uplinkId') == plan['extNetId']), None)
+                primaries = [subnet.get('primaryIp') for subnet in ((uplink or {}).get('subnets') or {}).get('values') or []]
+                if not uplink or plan['primary'] not in primaries:
+                    raise Exception("PATCH-15: edge gateway {}: {} is not attached with {} after the update".format(
+                        targetEdgeGateway['name'], plan['name'], plan['primary']))
+                plan['attached'] = True
+                logger.info("PATCH-15: edge gateway {}: {} attached as Tier-1 service interface ({} on {})".format(
+                    targetEdgeGateway['name'], plan['name'], plan['primary'], plan['network']))
+            self.saveMetadataInOrgVdc(force=True)
+
+    @isSessionExpired
+    def detachServiceUplinks(self):
+        """PATCH-15 rollback: removes the '<portgroup>-v2t' uplinks from the Tier-1s and confirms it."""
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        plans = data.get('serviceUplinks') or {}
+        for targetEdgeGateway in data.get('targetEdgeGateway', []):
+            edgePlans = [plan for plan in plans.get(targetEdgeGateway['name']) or [] if plan.get('extNetId')]
+            if not edgePlans:
+                continue
+            ids = [plan['extNetId'] for plan in edgePlans]
+            self._updateTargetEdgeUplinks(targetEdgeGateway, removeIds=ids)
+            current = self._readTargetEdge(targetEdgeGateway)
+            if current and any(uplink.get('uplinkId') in ids for uplink in current.get('edgeGatewayUplinks') or []):
+                raise Exception("PATCH-15: service uplinks are still attached to edge gateway {}".format(targetEdgeGateway['name']))
+            for plan in edgePlans:
+                plan['attached'] = False
+            self.saveMetadataInOrgVdc(force=True)
+            logger.info("RollBack: PATCH-15: service uplinks detached from edge gateway {}".format(targetEdgeGateway['name']))
+
+    @isSessionExpired
+    def deleteServiceUplinkNetworks(self, nsxtObj):
+        """
+        PATCH-15 rollback: deletes the VCD external networks and NSX-T segments this tool created. Ownership is only
+        cleared after deletion or confirmed absence; any other response keeps the record and stops the rollback.
+        """
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        plans = data.get('serviceUplinks') or {}
+        if not any(plans.values()):
+            return
+        sourceOrgVdcUuid = data['sourceOrgVDC']['@id'].split(':')[-1]
+        for edgeName, edgePlans in plans.items():
+            for plan in edgePlans:
+                created = plan.get('created') or {}
+                if created.get('extNet') or plan.get('extNetPending'):
+                    extNet = self._getExternalNetworkById(plan['extNetId']) if plan.get('extNetId') else \
+                        self._getExternalNetworkByName(plan['name'])
+                    if extNet and not (extNet.get('id') == plan.get('extNetId') or self._ownExternalNetwork(extNet, plan)):
+                        extNet = None  # a network of that name that is not ours: never deleted
+                    if extNet:
+                        url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
+                                               vcdConstants.ALL_EXTERNAL_NETWORKS, extNet['id'])
+                        response = self.restClientObj.delete(url, self._cloudApiHeaders())
+                        if response.status_code == requests.codes.accepted:
+                            self._checkTaskStatus(taskUrl=response.headers['Location'])
+                        elif response.status_code != requests.codes.not_found:
+                            raise Exception("PATCH-15: failed to delete external network {} (HTTP {}): {}".format(
+                                plan['name'], response.status_code, response.text[:300]))
+                        if self._getExternalNetworkById(extNet['id']) is not None:
+                            raise Exception("PATCH-15: external network {} still present after deletion".format(plan['name']))
+                        logger.info("RollBack: PATCH-15: VCD external network {} deleted".format(plan['name']))
+                    created['extNet'] = False
+                    plan['extNetPending'] = False
+                    plan['extNetId'] = None
+                    self.saveMetadataInOrgVdc(force=True)
+                if created.get('segment'):
+                    segment = self._getSegment(nsxtObj, plan['segmentId'])
+                    if segment is not None:
+                        if not self.ownedServiceUplinkSegment(segment, sourceOrgVdcUuid, plan):
+                            raise Exception("PATCH-15: NSX-T segment {} is not tagged as created by this tool for this portgroup "
+                                            "- not deleted".format(plan['segmentId']))
+                        intentPath = nsxtConstants.LOGICAL_SEGMENTS_ENDPOINT.format(plan['segmentId'])
+                        url = nsxtConstants.NSXT_HOST_POLICY_API.format(nsxtObj.ipAddress) + intentPath
+                        response = nsxtObj.restClientObj.delete(url=url, headers=nsxtConstants.NSXT_API_HEADER,
+                                                                auth=nsxtObj.restClientObj.auth)
+                        if response.status_code not in (requests.codes.ok, requests.codes.not_found):
+                            raise Exception("PATCH-15: failed to delete NSX-T segment {} (HTTP {}): {}".format(
+                                plan['segmentId'], response.status_code, response.text[:300]))
+                        nsxtObj.checkRealizedState(intentPath, markedForDelete=True)
+                        if self._getSegment(nsxtObj, plan['segmentId']) is not None:
+                            raise Exception("PATCH-15: NSX-T segment {} still present after deletion".format(plan['segmentId']))
+                        logger.info("RollBack: PATCH-15: NSX-T segment {} deleted".format(plan['name']))
+                    created['segment'] = False
+                    self.saveMetadataInOrgVdc(force=True)
+
+    @isSessionExpired
+    def configureServiceUplinkNoSnat(self):
+        """
+        PATCH-15 (services): on NSX-V an SNAT rule bound to another vNIC did not translate traffic leaving the
+        service uplink. On the Tier-1 such a rule would, so NO_SNAT rules are added for the uplink subnet and
+        the Tier-1 routes through it, for each enabled SNAT rule that NSX-V bound to a different vNIC. The
+        exception copies the rule's enabled state, internal addresses and application port profile.
+        """
+        self.normalizeServiceUplinkPlans()
+        data = self.rollback.apiData
+        plans = data.get('serviceUplinks') or {}
+        recorded = data.get('serviceUplinkNoSnat') or []
+        for sourceEdgeGateway in data.get('sourceEdgeGateway', []):
+            edgeName = sourceEdgeGateway['name']
+            edgePlans = [plan for plan in plans.get(edgeName) or [] if plan.get('attached')]
+            if not edgePlans:
+                continue
+            uplinkIndexes = {str(plan['vnicIndex']) for plan in edgePlans}
+            uplinkNames = {plan['name'] for plan in edgePlans}
+            destinations = sorted(set([plan['network'] for plan in edgePlans] + [
+                route['network'] for route in data.get('tier1StaticRoutes') or []
+                if route.get('edge') == edgeName and route.get('scope') in uplinkNames]))
+            sourceEdgeId = sourceEdgeGateway['id'].split(':')[-1]
+            natConfig = self.getEdgeGatewayNatConfig(sourceEdgeId, validation=False) or {}
+            boundElsewhere = {str(rule.get('ruleTag')) for rule in listify((natConfig.get('natRules') or {}).get('natRule'))
+                              if rule and rule.get('action') == 'snat' and str(rule.get('enabled', 'true')).lower() == 'true'
+                              and str(rule.get('vnic') or '') != '' and str(rule.get('vnic')) not in uplinkIndexes}
+            targetEdge = next(edge for edge in data['targetEdgeGateway'] if edge['name'] == edgeName)
+            url = "{}{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EDGE_GATEWAYS,
+                                  vcdConstants.T1_ROUTER_NAT_CONFIG.format(targetEdge['id']))
+            targetRules = self._listCloudApiValues(url)
+            existingNames = {rule.get('name') for rule in targetRules}
+            for rule in targetRules:
+                if rule.get('type') != 'SNAT' or str(rule.get('name')) not in boundElsewhere or rule.get('enabled') is False:
+                    continue
+                priority = int(rule.get('priority') or 0)
+                if priority == 0:
+                    logger.warning("PATCH-15: edge gateway {}: SNAT rule {} has priority 0; its NO_SNAT exceptions get the same "
+                                   "priority - verify on the Tier-1 that they are evaluated first".format(edgeName, rule['name']))
+                for index, destination in enumerate(destinations):
+                    name = 'v2t-uplink-nosnat-{}-{}'.format(rule['name'], index)
+                    if name in existingNames:
+                        continue
+                    payload = {'name': name, 'description': 'NSX V2T migration: no SNAT towards service uplink {}'.format(destination),
+                               'enabled': rule.get('enabled', True), 'type': 'NO_SNAT',
+                               'internalAddresses': rule.get('internalAddresses'), 'snatDestinationAddresses': destination,
+                               'applicationPortProfile': rule.get('applicationPortProfile'), 'logging': False,
+                               'priority': max(priority - 1, 0), 'firewallMatch': rule.get('firewallMatch')}
+                    response = self.restClientObj.post(url, self._cloudApiHeaders(), data=json.dumps(payload))
+                    if response.status_code != requests.codes.accepted:
+                        raise Exception("PATCH-15: failed to create NO_SNAT rule {} on edge gateway {}: {}".format(
+                            name, edgeName, response.text[:300]))
+                    self._checkTaskStatus(taskUrl=response.headers['Location'])
+                    recorded.append({'edge': edgeName, 'name': name})
+                    data['serviceUplinkNoSnat'] = recorded
+                    self.saveMetadataInOrgVdc(force=True)
+                    logger.info("PATCH-15: edge gateway {}: NO_SNAT {} for SNAT rule {} towards {}".format(
+                        edgeName, name, rule['name'], destination))
     # ------------------------------------------------------------------------------------------------------
 
 
@@ -221,78 +918,77 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
 
     def _updateTargetExternalNetworkPool(self):
         # Acquiring lock as only one operation can be performed on an external network at a time
-        self.lock.acquire(blocking=True)
-        logger.debug("Updating Target External networks with sub allocated ip pools")
+        with self.lock:  # PATCH-16: released on every exit path (returns and exceptions)
+            logger.debug("Updating Target External networks with sub allocated ip pools")
 
-        edgeGatewaySubnetDict = self._getEdgeGatewaySubnets()
+            edgeGatewaySubnetDict = self._getEdgeGatewaySubnets()
 
-        for targetExtNetName, sourceEgwSubnets in edgeGatewaySubnetDict.items():
-            logger.debug("Updating Target External network {} with sub allocated ip pools".format(targetExtNetName))
-            targetExtNetData = self.getExternalNetworkByName(targetExtNetName)
-            if targetExtNetData.get("usingIpSpace"):
-                ipSpaces = self.getProviderGatewayIpSpaces(targetExtNetData)
-                for edgeGatewaySubnet, edgeGatewayIpRangesList in sourceEgwSubnets.items():
+            for targetExtNetName, sourceEgwSubnets in edgeGatewaySubnetDict.items():
+                logger.debug("Updating Target External network {} with sub allocated ip pools".format(targetExtNetName))
+                targetExtNetData = self.getExternalNetworkByName(targetExtNetName)
+                if targetExtNetData.get("usingIpSpace"):
+                    ipSpaces = self.getProviderGatewayIpSpaces(targetExtNetData)
+                    for edgeGatewaySubnet, edgeGatewayIpRangesList in sourceEgwSubnets.items():
+                        for ipSpace in ipSpaces:
+                            if [internalScope for internalScope in ipSpace["ipSpaceInternalScope"]
+                                if type(edgeGatewaySubnet) == type(
+                                    ipaddress.ip_network('{}'.format(internalScope), strict=False)) and
+                                   self.subnetOf(edgeGatewaySubnet,
+                                                 ipaddress.ip_network('{}'.format(internalScope), strict=False))]:
+                                # Adding IPs used by edge gateway from this subnet to IP Space ranges
+                                self._prepareIpSpaceRanges(ipSpace, edgeGatewayIpRangesList)
                     for ipSpace in ipSpaces:
-                        if [internalScope for internalScope in ipSpace["ipSpaceInternalScope"]
-                            if type(edgeGatewaySubnet) == type(
-                                ipaddress.ip_network('{}'.format(internalScope), strict=False)) and
-                               self.subnetOf(edgeGatewaySubnet,
-                                             ipaddress.ip_network('{}'.format(internalScope), strict=False))]:
-                            # Adding IPs used by edge gateway from this subnet to IP Space ranges
-                            self._prepareIpSpaceRanges(ipSpace, edgeGatewayIpRangesList)
-                for ipSpace in ipSpaces:
-                    url = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.UPDATE_IP_SPACES.format(ipSpace["id"]))
+                        url = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.UPDATE_IP_SPACES.format(ipSpace["id"]))
+                        self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
+                        response = self.restClientObj.put(url, self.headers, data=json.dumps(ipSpace))
+                        if response.status_code == requests.codes.accepted:
+                            taskUrl = response.headers['Location']
+                            self._checkTaskStatus(taskUrl=taskUrl)
+                            logger.debug("Provider Gateway IP Space uplink - '{}' updated successfully with sub allocated ip pools.".format(
+                                ipSpace['name']))
+                        else:
+                            errorResponse = response.json()
+                            raise Exception("Provider Gateway IP Space uplink - '{}' with sub allocated ip pools - {}".format(
+                                ipSpace['name'], errorResponse['message']))
+                else:
+                    for targetExtNetSubnet in targetExtNetData['subnets']['values']:
+                        targetExtNetSubnetAddress = ipaddress.ip_network(
+                            '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
+                        # PATCH-1: tolerate a null pool; PATCH-1b: never add an IP that is already in the target pool
+                        if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):
+                            targetExtNetSubnet['ipRanges'] = {}
+                        existingRanges = targetExtNetSubnet['ipRanges'].get('values') or []
+                        existingIps = set()
+                        for existingRange in existingRanges:
+                            existingIps.update(range(int(ipaddress.ip_address(existingRange['startAddress'])),
+                                                     int(ipaddress.ip_address(existingRange['endAddress'])) + 1))
+                        for newRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
+                            for ipInt in range(int(ipaddress.ip_address(newRange['startAddress'])),
+                                               int(ipaddress.ip_address(newRange['endAddress'])) + 1):
+                                if ipInt not in existingIps:
+                                    ipStr = str(ipaddress.ip_address(ipInt))
+                                    existingRanges.append({'startAddress': ipStr, 'endAddress': ipStr})
+                                    existingIps.add(ipInt)
+                                else:
+                                    logger.debug("PATCH-1b: IP {} already in target external network pool, not added again".format(
+                                        ipaddress.ip_address(ipInt)))
+                        targetExtNetSubnet['ipRanges']['values'] = existingRanges
+
+                    url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
+                                           vcdConstants.ALL_EXTERNAL_NETWORKS, targetExtNetData['id'])
                     self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
-                    response = self.restClientObj.put(url, self.headers, data=json.dumps(ipSpace))
+                    response = self.restClientObj.put(url, self.headers, data=json.dumps(targetExtNetData))
                     if response.status_code == requests.codes.accepted:
                         taskUrl = response.headers['Location']
                         self._checkTaskStatus(taskUrl=taskUrl)
-                        logger.debug("Provider Gateway IP Space uplink - '{}' updated successfully with sub allocated ip pools.".format(
-                            ipSpace['name']))
+                        logger.debug('Target External network {} updated successfully with sub allocated ip pools.'.format(
+                            targetExtNetData['name']))
                     else:
                         errorResponse = response.json()
-                        raise Exception("Provider Gateway IP Space uplink - '{}' with sub allocated ip pools - {}".format(
-                            ipSpace['name'], errorResponse['message']))
-            else:
-                for targetExtNetSubnet in targetExtNetData['subnets']['values']:
-                    targetExtNetSubnetAddress = ipaddress.ip_network(
-                        '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
-                    # PATCH-1: tolerate a null pool; PATCH-1b: never add an IP that is already in the target pool
-                    if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):
-                        targetExtNetSubnet['ipRanges'] = {}
-                    existingRanges = targetExtNetSubnet['ipRanges'].get('values') or []
-                    existingIps = set()
-                    for existingRange in existingRanges:
-                        existingIps.update(range(int(ipaddress.ip_address(existingRange['startAddress'])),
-                                                 int(ipaddress.ip_address(existingRange['endAddress'])) + 1))
-                    for newRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
-                        for ipInt in range(int(ipaddress.ip_address(newRange['startAddress'])),
-                                           int(ipaddress.ip_address(newRange['endAddress'])) + 1):
-                            if ipInt not in existingIps:
-                                ipStr = str(ipaddress.ip_address(ipInt))
-                                existingRanges.append({'startAddress': ipStr, 'endAddress': ipStr})
-                                existingIps.add(ipInt)
-                            else:
-                                logger.debug("PATCH-1b: IP {} already in target external network pool, not added again".format(
-                                    ipaddress.ip_address(ipInt)))
-                    targetExtNetSubnet['ipRanges']['values'] = existingRanges
+                        raise Exception('Failed to update External network {} with sub allocated ip pools - {}'.format(
+                            targetExtNetData['name'], errorResponse['message']))
 
-                url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
-                                       vcdConstants.ALL_EXTERNAL_NETWORKS, targetExtNetData['id'])
-                self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
-                response = self.restClientObj.put(url, self.headers, data=json.dumps(targetExtNetData))
-                if response.status_code == requests.codes.accepted:
-                    taskUrl = response.headers['Location']
-                    self._checkTaskStatus(taskUrl=taskUrl)
-                    logger.debug('Target External network {} updated successfully with sub allocated ip pools.'.format(
-                        targetExtNetData['name']))
-                else:
-                    errorResponse = response.json()
-                    raise Exception('Failed to update External network {} with sub allocated ip pools - {}'.format(
-                        targetExtNetData['name'], errorResponse['message']))
-
-        # Releasing lock
-        self.lock.release()
+            # Releasing lock
 
     def _prepareIpSpaceRanges(self, ipSpace, edgeGatewayIpRangesList, rollback=False):
 
@@ -546,7 +1242,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                     'Target Org VDC Edge Gateway {} disconnected from segment backed external networks successfully.'.format(targetEdgeGateway['name']))
             else:
                 raise Exception(
-                    'Failed to disconnect target Org VDC Edge Gateway from external networks {}'.format(targetEdgeGateway['name'],
+                    'Failed to disconnect target Org VDC Edge Gateway {} from external networks - {}'.format(targetEdgeGateway['name'],
                                                                                    response.json()['message']))
         logger.debug('Successfully disconnect target Edge gateway from external network directly connected to T1.')
 
@@ -584,9 +1280,10 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
 
             # set a flag for allow non distributed routing
             if payLoadDict['nonDistributedRoutingEnabled']:
+                # PATCH-16: continue with the next edge gateway instead of returning
                 logger.debug('Allow non distributed routing is already enabled for edge gateway {}.'
                              .format(gatewayName))
-                return
+                continue
 
             payLoadDict['nonDistributedRoutingEnabled'] = True
             payLoadData = json.dumps(payLoadDict)
@@ -1392,40 +2089,39 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         if not self.rollback.apiData.get("ipBlockToBeAddedToIpSpaceUplinks", {}):
             return
         # Acquiring lock as only one ipspace can be updated at a time
-        self.lock.acquire(blocking=True)
-        for ipSpaceId, ipPrefixList in self.rollback.apiData.get("ipBlockToBeAddedToIpSpaceUplinks", {}).items():
-            ipSpaceDict = self.fetchIpSpace(ipSpaceId)
-            preFixNetworkList = [ipaddress.ip_network(prefix, strict=False) for prefix in ipPrefixList]
-            targetPrefixes = []
-            for ipPrefix in ipSpaceDict.get("ipSpacePrefixes", []):
-                targetPrefixSequence = [prefixSequence for prefixSequence in ipPrefix["ipPrefixSequence"]
-                                        if ipaddress.ip_network("{}/{}".format(prefixSequence["startingPrefixIpAddress"],
-                                                                               prefixSequence["prefixLength"]), strict=False) not in preFixNetworkList]
-                if targetPrefixSequence:
-                    targetPrefixes.append({
-                        "ipPrefixSequence": targetPrefixSequence,
-                        "defaultQuotaForPrefixLength": ipPrefix["defaultQuotaForPrefixLength"]
-                    })
-            ipSpaceDict["ipSpacePrefixes"] = targetPrefixes if targetPrefixes else None
-            ipSpaceUrl = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
-                                       vcdConstants.UPDATE_IP_SPACES.format(ipSpaceId))
-            headers = {'Authorization': self.headers['Authorization'],
-                       'Accept': vcdConstants.OPEN_API_CONTENT_TYPE}
-            payloadData = json.dumps(ipSpaceDict)
-            response = self.restClientObj.put(ipSpaceUrl, headers=headers, data=payloadData)
-            if response.status_code == requests.codes.accepted:
-                taskUrl = response.headers['Location']
-                # checking the status of the creating org vdc network task
-                self._checkTaskStatus(taskUrl=taskUrl)
-                logger.debug("Prefixes - '{}' removed from IP Space Uplink - '{}' successfully.".format(ipPrefixList, ipSpaceId))
-            else:
-                errorResponse = response.json()
-                raise Exception(
-                    "Failed to remove Prefixes - '{}' from IP Space Uplink - '{}' with error - {}".format(prefixList, ipSpaceId,
-                                                                                                   errorResponse['message']))
-        logger.debug("Removed IP Prefixes from respective IP Space Uplinks successfully")
-        # Releasing lock
-        self.lock.release()
+        with self.lock:  # PATCH-16: released on every exit path (returns and exceptions)
+            for ipSpaceId, ipPrefixList in self.rollback.apiData.get("ipBlockToBeAddedToIpSpaceUplinks", {}).items():
+                ipSpaceDict = self.fetchIpSpace(ipSpaceId)
+                preFixNetworkList = [ipaddress.ip_network(prefix, strict=False) for prefix in ipPrefixList]
+                targetPrefixes = []
+                for ipPrefix in ipSpaceDict.get("ipSpacePrefixes", []):
+                    targetPrefixSequence = [prefixSequence for prefixSequence in ipPrefix["ipPrefixSequence"]
+                                            if ipaddress.ip_network("{}/{}".format(prefixSequence["startingPrefixIpAddress"],
+                                                                                   prefixSequence["prefixLength"]), strict=False) not in preFixNetworkList]
+                    if targetPrefixSequence:
+                        targetPrefixes.append({
+                            "ipPrefixSequence": targetPrefixSequence,
+                            "defaultQuotaForPrefixLength": ipPrefix["defaultQuotaForPrefixLength"]
+                        })
+                ipSpaceDict["ipSpacePrefixes"] = targetPrefixes if targetPrefixes else None
+                ipSpaceUrl = "{}{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
+                                           vcdConstants.UPDATE_IP_SPACES.format(ipSpaceId))
+                headers = {'Authorization': self.headers['Authorization'],
+                           'Accept': vcdConstants.OPEN_API_CONTENT_TYPE}
+                payloadData = json.dumps(ipSpaceDict)
+                response = self.restClientObj.put(ipSpaceUrl, headers=headers, data=payloadData)
+                if response.status_code == requests.codes.accepted:
+                    taskUrl = response.headers['Location']
+                    # checking the status of the creating org vdc network task
+                    self._checkTaskStatus(taskUrl=taskUrl)
+                    logger.debug("Prefixes - '{}' removed from IP Space Uplink - '{}' successfully.".format(ipPrefixList, ipSpaceId))
+                else:
+                    errorResponse = response.json()
+                    raise Exception(
+                        "Failed to remove Prefixes - '{}' from IP Space Uplink - '{}' with error - {}".format(ipPrefixList, ipSpaceId,
+                                                                                                       errorResponse['message']))
+            logger.debug("Removed IP Prefixes from respective IP Space Uplinks successfully")
+            # Releasing lock
 
     @isSessionExpired
     def removeManuallyAddedUplinks(self):
@@ -1435,23 +2131,22 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         if not self.rollback.apiData.get("manuallyAddedUplinks", []):
             return
         # Acquiring lock as only one uplink can be added to provider gateway at a time
-        self.lock.acquire(blocking=True)
-        for ipSpaceId, ipSpaceUplinkId in self.rollback.apiData.get("manuallyAddedUplinks", []):
-            url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.IP_SPACE_UPLINKS, ipSpaceUplinkId)
-            headers = {'Authorization': self.headers['Authorization'],
-                       'Accept': vcdConstants.OPEN_API_CONTENT_TYPE}
-            delResponse = self.restClientObj.delete(url, headers=headers)
-            if delResponse.status_code == requests.codes.accepted:
-                taskUrl = delResponse.headers['Location']
-                # checking the status of deleting nsx-v backed edge gateway task
-                self._checkTaskStatus(taskUrl=taskUrl)
-                logger.debug('IP Space Uplink removed successfully')
-            else:
-                delResponseDict = delResponse.content.json()
-                raise Exception("Failed to remove IP Space uplink - '{}' due to error ".format(ipSpaceUplinkId, delResponseDict["message"]))
-        logger.debug("Removed manually added Uplinks to IP Space Provider Gateways during migration successfully")
-        # Releasing lock
-        self.lock.release()
+        with self.lock:  # PATCH-16: released on every exit path (returns and exceptions)
+            for ipSpaceId, ipSpaceUplinkId in self.rollback.apiData.get("manuallyAddedUplinks", []):
+                url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.IP_SPACE_UPLINKS, ipSpaceUplinkId)
+                headers = {'Authorization': self.headers['Authorization'],
+                           'Accept': vcdConstants.OPEN_API_CONTENT_TYPE}
+                delResponse = self.restClientObj.delete(url, headers=headers)
+                if delResponse.status_code == requests.codes.accepted:
+                    taskUrl = delResponse.headers['Location']
+                    # checking the status of deleting nsx-v backed edge gateway task
+                    self._checkTaskStatus(taskUrl=taskUrl)
+                    logger.debug('IP Space Uplink removed successfully')
+                else:
+                    delResponseDict = delResponse.json()  # PATCH-17: was .content.json(), and the message was not printed
+                    raise Exception("Failed to remove IP Space uplink - '{}' due to error {}".format(ipSpaceUplinkId, delResponseDict.get("message")))
+            logger.debug("Removed manually added Uplinks to IP Space Provider Gateways during migration successfully")
+            # Releasing lock
 
     @isSessionExpired
     def deleteNsxVBackedOrgVDCEdgeGateways(self, orgVDCId):
@@ -2036,7 +2731,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                 break
                         else:
                             raise Exception("Could not find disk storage policy {} in target Org VDC.".
-                                            format(storagePolicy['@name']))
+                                            format(diskSetting['StorageProfile']['@name']))  # PATCH-17: the disk's policy
                         diskSection.append(diskSettingDict)
 
                     hardwareVersionDict = {"href": vm['hardwareVersion']['@href'],
@@ -2079,6 +2774,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                             targetProviderVDCid = data['sourceProviderVDC']['@id']
                         else:
                             targetProviderVDCid = data['targetProviderVDC']['@id']
+                        # PATCH-17: no placement policy carries over from the previous VM
+                        href = None
                         # iterating over the org vdc compute policies
                         for eachComputPolicy in orgVDCComputePolicesList:
                             # checking if the org vdc compute policy name is same as the source vm's applied compute policy & org vdc compute policy id is same as that of target provider vdc's id
@@ -2139,6 +2836,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                             targetProviderVDCid = data['sourceProviderVDC']['@id']
                         else:
                             targetProviderVDCid = data['targetProviderVDC']['@id']
+                        # PATCH-17: no placement policy carries over from the previous VM
+                        href = None
                         # iterating over the org vdc compute policies
                         for eachComputPolicy in orgVDCComputePolicesList:
                             # checking if the org vdc compute policy name is same as the source vm's applied compute policy & org vdc compute policy id is same as that of target provider vdc's id
@@ -2795,8 +3494,15 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         elif data["natInterfaces"][sourceEdgeGatewayId][natRule["name"]] in data.get("isT1Connected", {}).get(sourceEdgeGateway["name"], {}):
                             payLoad["appliedTo"] = {"id": data["segmentToIdMapping"][
                                 data["natInterfaces"][sourceEdgeGatewayId][natRule["name"]] + '-v2t']}
+                        elif (self.serviceUplinkPlan(sourceEdgeGateway["name"], portgroupName=data["natInterfaces"][
+                                sourceEdgeGatewayId][natRule["name"]]) or {}).get('extNetId'):
+                            # PATCH-15: NAT rule bound to a service uplink on NSX-V stays bound to it on the Tier-1
+                            payLoad["appliedTo"] = {"id": self.serviceUplinkPlan(sourceEdgeGateway["name"], portgroupName=data[
+                                "natInterfaces"][sourceEdgeGatewayId][natRule["name"]])['extNetId']}
                     else:
-                        if data["natInterfaces"][sourceEdgeGatewayId][natRule["name"]] + '-v2t' not in data['segmentToIdMapping']:
+                        if data["natInterfaces"][sourceEdgeGatewayId][natRule["name"]] + '-v2t' not in data['segmentToIdMapping'] \
+                                and not self.serviceUplinkPlan(sourceEdgeGateway["name"], portgroupName=data["natInterfaces"][
+                                    sourceEdgeGatewayId][natRule["name"]]):
                             continue
                         payLoad["appliedTo"] = None
 
@@ -3507,6 +4213,9 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             # creating target Org VDC Edge Gateway
             self.createEdgeGateway(nsxObj)
 
+            # PATCH-15: NSX-T VLAN segments and VCD external networks for edge interfaces unknown to VCD
+            self.createServiceUplinkNetworks(nsxObj)
+
             # disconnecting external network directly connected to T1 via CSP port
             self.disconnectSegmentBackedNetwork()
 
@@ -3621,6 +4330,9 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             # disconnecting source org vdc edge gateway from external
             self.reconnectOrDisconnectSourceEdgeGateway(sourceEdgeGatewayIdList, connect=False)
 
+            # PATCH-15: disconnecting the NSX-V vNICs that move to Tier-1 service interfaces
+            self.disconnectServiceUplinkVnics()
+
             if targetOrgVDCNetworkList:
                 # reconnecting target Org VDC networks
                 self.reconnectOrgVDCNetworks(sourceOrgVDCId, targetOrgVDCId, source=False)
@@ -3642,17 +4354,26 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             # reconnecting target org vdc edge gateway from T0
             self.reconnectTargetEdgeGateway()
 
+            # PATCH-15: attaching service uplinks to the target edge gateways (same IPs as the NSX-V vNICs)
+            self.attachServiceUplinks()
+
             # set static route scopes
             self.setStaticRoutesScope()
 
             # setting static routes for NSX-T segment directly connected to target edge gateways
             self.setEdgeGatewayStaticRoutes()
 
+            # PATCH-14 part 2: static routes on the tenant Tier-1s (only with Tier1StaticRoutes in the user input)
+            self.configureTier1StaticRoutes()
+
             # PATCH-10: Tier-0 static routes for DMZ networks (only with DmzStaticRoutes in the user input)
             self.configureDmzStaticRoutes(nsxtObj)
 
             # update NAT rules in internal interfaces
             self.updateNATRules()
+
+            # PATCH-15: NO_SNAT exceptions towards service uplinks
+            self.configureServiceUplinkNoSnat()
 
             # update firewall rules
             self.updateFirewallRules()
@@ -3722,7 +4443,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             vrfData = nsxtObj.getVRFdetails(vrfBackingId)
             bgpConfigDict = self.getEdgegatewayBGPconfig(edgeGatewayId, validation=False)
             routeRedistributionRules = vrfData["results"][0].get("route_redistribution_config", {}).get("redistribution_rules", [])
-            advertisedSubnets = vcdConstants.ADVERTISED_SUBNET_LIST
+            # PATCH-17: a copy - appending to the module constant leaked TIER1_CONNECTED into later edge gateways
+            advertisedSubnets = list(vcdConstants.ADVERTISED_SUBNET_LIST)
             if (self.getStaticRoutesDetails(edgeGatewayId)
                     or isinstance(bgpConfigDict, dict) and bgpConfigDict['enabled'] == 'true'
                     or self.orgVdcInput['EdgeGateways'][edge['name']]['AdvertiseRoutedNetworks']):
@@ -3926,7 +4648,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         # creating payload data to move media
                         payloadDict = {'catalogItemName': catalogItem['@name'],
                                        'catalogItemHref': catalogItem['@href']}
-                        self.moveCatalogItem(payloadDict, catalogId, timeout)
+                        (self.moveCatalogItem if finalize else self._moveCatalogItemRecorded)(payloadDict, catalogId, timeout)  # PATCH-11
 
                     # moving each catalog item from the 'vAppTemplateCatalogItemList' to target catalog created above
                     for catalogItem in vAppTemplateCatalogItemList:
@@ -3934,7 +4656,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                         # creating payload data to move vapp template
                         payloadDict = {'catalogItemName': catalogItem['@name'],
                                        'catalogItemHref': catalogItem['@href']}
-                        self.moveCatalogItem(payloadDict, catalogId, timeout)
+                        (self.moveCatalogItem if finalize else self._moveCatalogItemRecorded)(payloadDict, catalogId, timeout)  # PATCH-11
 
                     if finalize:
                         # deleting the source org vdc catalog
@@ -4089,7 +4811,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                 payloadDict = {'catalogItemName': catalogItem['@name'],
                                                'catalogItemHref': catalogItem['catalogItemHref']}
                                 # move api call to migrate the catalog item
-                                self.moveCatalogItem(payloadDict, catalogId, timeout)
+                                (self.moveCatalogItem if finalize else self._moveCatalogItemRecorded)(payloadDict, catalogId, timeout)  # PATCH-11
 
                         # iterating over the catalog items in mediaCatalogItemList
                         for catalogItem in vAppTemplateCatalogItemList:
@@ -4100,7 +4822,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                 payloadDict = {'catalogItemName': catalogItem['@name'],
                                                'catalogItemHref': catalogItem['catalogItemHref']}
                                 # move api call to migrate the catalog item
-                                self.moveCatalogItem(payloadDict, catalogId, timeout)
+                                (self.moveCatalogItem if finalize else self._moveCatalogItemRecorded)(payloadDict, catalogId, timeout)  # PATCH-11
 
                         catalogData = {'@name': catalog['catalogName'],
                                        '@href': catalog['catalogHref'],
@@ -5532,7 +6254,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             # PUT API for updating catalog owner
             updateCatalogOwner = self.restClientObj.put(putUrl, headers, data=payloadData)
 
-            if updateCatalogOwner.status_code == (requests.codes.no_content or requests.codes.ok):
+            # PATCH-17: '(204 or 200)' evaluated to 204 only
+            if updateCatalogOwner.status_code in (requests.codes.no_content, requests.codes.ok):
                 logger.debug("Catalog '{}' owner updated successfully".format(catalogResponseDict['AdminCatalog']['@name']))
             else:
                 errorDict = self.vcdUtils.parseXml(updateCatalogOwner.content)
@@ -5625,7 +6348,8 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             # POST API for sharing Read-Only access of catalog to all Orgs
             response = self.restClientObj.post(readAccessUrl, headers, data=publishPayloadData)
 
-            if response.status_code == (requests.codes.no_content or requests.codes.ok):
+            # PATCH-17: '(204 or 200)' evaluated to 204 only
+            if response.status_code in (requests.codes.no_content, requests.codes.ok):
                 logger.debug(
                     "Catalog '{}'s READ-ONLY Access shared to all ORGs Successfully".format(migratedCatalogName))
                 return
@@ -5701,8 +6425,41 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         moves = self.rollback.apiData.get('catalogMoves') or []
         if not any(move['dstId'] == dstId for move in moves):
             moves.append({'srcHref': srcHref, 'srcName': srcName, 'srcDescription': srcDescription,
-                          'dstId': dstId, 'dstName': dstName, 'created': created})
+                          'dstId': dstId, 'dstName': dstName, 'created': created, 'items': []})
             self._saveCatalogMoves(moves)
+
+    def _catalogItemEntity(self, catalogItemHref):
+        """PATCH-11: href of the vApp template or media behind a catalog item (stable across moves and renames);
+        None when VCD confirms the item does not exist."""
+        response = self.restClientObj.get(catalogItemHref, headers=self.headers)
+        if response.status_code == requests.codes.not_found:
+            return None
+        if response.status_code != requests.codes.ok:
+            raise Exception("PATCH-11: failed to read catalog item {} (HTTP {})".format(catalogItemHref, response.status_code))
+        entity = (self.vcdUtils.parseXml(response.content).get('CatalogItem') or {}).get('Entity') or {}
+        if not entity.get('@href'):
+            raise Exception("PATCH-11: catalog item {} has no entity reference".format(catalogItemHref))
+        return entity['@href']
+
+    def _moveCatalogItemRecorded(self, catalogItem, catalogId, timeout):
+        """PATCH-11 (--movecatalog): moves one item and records it by its entity (vApp template/media), so rollback
+        moves back exactly these items, also when they were renamed. The item is recorded before the move."""
+        moves = self.rollback.apiData.get('catalogMoves') or []
+        move = next((m for m in moves if m['dstId'] == catalogId), None)
+        if move is None:
+            raise Exception("PATCH-11: no catalog move record for catalog {}".format(catalogId))
+        items = move.setdefault('items', [])
+        entity = self._catalogItemEntity(catalogItem['catalogItemHref'])
+        if entity is None:
+            raise Exception("PATCH-11: catalog item {} not found".format(catalogItem['catalogItemName']))
+        if entity not in [item.get('entity') for item in items]:
+            items.append({'name': catalogItem['catalogItemName'], 'entity': entity, 'state': 'moving'})
+            self._saveCatalogMoves(moves)
+        self.moveCatalogItem(catalogItem, catalogId, timeout)
+        for item in items:
+            if item.get('entity') == entity:
+                item['state'] = 'moved'
+        self._saveCatalogMoves(moves)
 
     def _saveCatalogMoves(self, moves, target=True):
         """Persists the catalog move records in the source Org VDC metadata (used by rollback) and, after the
@@ -5740,21 +6497,63 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         logger.info("Catalog items moved for {} catalog(s): {}".format(
             len(moves), ', '.join("{} -> {}".format(m['srcName'], m['dstName']) for m in moves) or 'none'))
 
+    def _catalogEntities(self, catalogHref):
+        """PATCH-11: {entity href: catalog item} of a catalog."""
+        return {self._catalogItemEntity(item['@href']): item for item in self._catalogItems(catalogHref)}
+
     def rollbackCatalogMoves(self, timeout=7200):
-        """PATCH-11: rollback of --movecatalog - moves all items of the '-v2t' catalogs back to the source catalogs."""
+        """
+        PATCH-11: rollback of --movecatalog - moves the items this tool moved (recorded by entity) back to their
+        source catalogs. Other items of the '-v2t' catalog stay where they are. A record is cleared only when every
+        recorded item is confirmed in its source catalog; a '-v2t' catalog the tool created is deleted only when it
+        is empty. Records written without an item list are refused: they cannot tell which items the tool moved.
+        """
         data = self.rollback.apiData
         moves = data.get('catalogMoves') or []
         if not moves:
             return
         logger.info("RollBack: Moving catalog items back to the source catalogs")
         for move in list(moves):
+            if 'items' not in move:
+                raise Exception("PATCH-11: the record of catalog '{}' does not list the moved items (earlier record format) - "
+                                "move the items that belong to '{}' back manually, then remove its 'catalogMoves' entry from "
+                                "the Org VDC metadata".format(move['dstName'], move['srcName']))
             dstHref = "{}{}".format(vcdConstants.XML_ADMIN_API_URL.format(self.ipAddress), "catalog/{}".format(move['dstId']))
             srcId = move['srcHref'].rstrip('/').split('/')[-1]
-            for item in self._catalogItems(dstHref):
-                logger.debug("RollBack: moving catalog item '{}' back to '{}'".format(item['@name'], move['srcName']))
-                self.moveCatalogItem({'catalogItemName': item['@name'], 'catalogItemHref': item['@href']}, srcId, timeout)
-            if move.get('created') and not self._catalogItems(dstHref):
-                self.deleteSourceCatalog(dstHref, {'@name': move['dstName']})
+            response = self.restClientObj.get(dstHref, headers=self.headers)
+            if response.status_code not in (requests.codes.ok, requests.codes.not_found):
+                raise Exception("PATCH-11: failed to read catalog '{}' (HTTP {})".format(move['dstName'], response.status_code))
+            dstExists = response.status_code == requests.codes.ok
+            # items recorded without their entity (previous build) are identified through the recorded item href
+            for item in move.get('items') or []:
+                if not item.get('entity'):
+                    entity = self._catalogItemEntity(item['href']) if item.get('href') else None
+                    if entity is None:
+                        raise Exception("PATCH-11: catalog item '{}' of '{}' cannot be identified - move it back manually, "
+                                        "then remove it from the 'catalogMoves' record".format(item.get('name'), move['dstName']))
+                    item['entity'] = entity
+            pending = {item['entity']: item for item in move.get('items') or []}
+            if pending:
+                for entity, item in (self._catalogEntities(dstHref) if dstExists else {}).items():
+                    if entity in pending:
+                        logger.debug("RollBack: moving catalog item '{}' back to '{}'".format(item['@name'], move['srcName']))
+                        self.moveCatalogItem({'catalogItemName': item['@name'], 'catalogItemHref': item['@href']}, srcId, timeout)
+                inSource = self._catalogEntities(move['srcHref'])
+                unresolved = [item['name'] for entity, item in pending.items() if entity not in inSource]
+                if unresolved:
+                    raise Exception("PATCH-11: catalog item(s) {} are neither in '{}' nor back in '{}' - not cleared from the "
+                                    "record".format(', '.join(unresolved), move['dstName'], move['srcName']))
+                move['items'] = []
+                self._saveCatalogMoves(moves, target=False)
+            if move.get('created') and dstExists:
+                leftOver = self._catalogItems(dstHref)
+                if not leftOver:
+                    move['state'] = 'deleting'
+                    self._saveCatalogMoves(moves, target=False)
+                    self.deleteSourceCatalog(dstHref, {'@name': move['dstName']})
+                else:
+                    logger.warning("RollBack: catalog '{}' keeps {} item(s) not moved by this tool - not deleted".format(
+                        move['dstName'], len(leftOver)))
             moves.remove(move)
             self._saveCatalogMoves(moves, target=False)
         logger.info("RollBack: catalog items are back in the source catalogs")
@@ -5764,16 +6563,28 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         PATCH-11: cleanup for --movecatalog pairs that cleanup's catalog migration did not finish itself
         (catalogs without a storage policy): delete the empty source catalog and drop the '-v2t' suffix.
         A source catalog that still holds items (e.g. of other Org VDCs) is kept; the '-v2t' catalog then keeps
-        its name and a warning is logged.
+        its name and a warning is logged. Unexpected responses stop the cleanup and keep the record; each
+        finished pair is saved right away.
         """
         data = self.rollback.apiData
         moves = data.get('catalogMoves') or []
         if not moves:
             return
+        targetOrgVDCId = data.get('targetOrgVDC', {}).get('@id')
+
+        def checkpoint():
+            data['catalogMoves'] = moves
+            if targetOrgVDCId:
+                self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={'catalogMoves': moves})
+
         for move in list(moves):
             dstHref = "{}{}".format(vcdConstants.XML_ADMIN_API_URL.format(self.ipAddress), "catalog/{}".format(move['dstId']))
             response = self.restClientObj.get(dstHref, headers=self.headers)
-            if response.status_code == requests.codes.ok:
+            if response.status_code == requests.codes.not_found:
+                logger.warning("PATCH-11: catalog '{}' no longer exists - nothing to finalize".format(move['dstName']))
+            elif response.status_code != requests.codes.ok:
+                raise Exception("PATCH-11: failed to read catalog '{}' (HTTP {})".format(move['dstName'], response.status_code))
+            else:
                 dst = self.vcdUtils.parseXml(response.content).get('AdminCatalog', {})
                 if dst.get('@name') == move['dstName']:
                     srcResponse = self.restClientObj.get(move['srcHref'], headers=self.headers)
@@ -5782,15 +6593,15 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                             logger.warning("PATCH-11: source catalog '{}' still has items - it is kept and '{}' keeps its "
                                            "name".format(move['srcName'], move['dstName']))
                             moves.remove(move)
+                            checkpoint()
                             continue
                         self.deleteSourceCatalog(move['srcHref'], {'@name': move['srcName']})
+                    elif srcResponse.status_code != requests.codes.not_found:
+                        raise Exception("PATCH-11: failed to read source catalog '{}' (HTTP {})".format(
+                            move['srcName'], srcResponse.status_code))
                     self.renameTargetCatalog(move['dstId'], {'@name': move['srcName'], 'Description': move['srcDescription']})
             moves.remove(move)
-        data['catalogMoves'] = moves
-        # PATCH-11 (v1.5.5 fix): save the finished list on the target so a re-run does not see stale pairs
-        targetOrgVDCId = data.get('targetOrgVDC', {}).get('@id')
-        if targetOrgVDCId:
-            self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={'catalogMoves': moves})
+            checkpoint()
     # --------------------------------------------------------------------------------------------------------
 
     @isSessionExpired
@@ -6993,7 +7804,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 'backingNetworkId': segmetId
             }
         else:
-            raise Exception('Failed to get external network {} vlan ID'.format(
+            raise Exception('Failed to get external network {} vlan ID - {}'.format(
                 parentNetworkId['name'], responseDict['message']))
         return segmentName, payload
 
@@ -7043,7 +7854,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                     'shared': Shared
                 }
         else:
-            raise (
+            raise Exception(  # PATCH-17: raising a string is a TypeError that hides this message
                 f"NSXT segment backed external network {parentNetworkId['name'] + '-v2t'} is not present, and it is "
                 f"required for this direct shared network - {orgvdcNetwork['name']}")
         return payload

@@ -47,7 +47,10 @@ class Rollback:
             'vcdObj.setStaticRoutesScope(rollback=True)',
             'vcdObj.disconnectTargetOrgVDCNetwork(rollback=True)',
             'vcdObj.removeDmzStaticRoutes(nsxtObj)',  # PATCH-10
+            'vcdObj.removeTier1StaticRoutes()',  # PATCH-14
+            'vcdObj.detachServiceUplinks()',  # PATCH-15: the Tier-1 releases the IPs first
             'vcdObj.reconnectTargetEdgeGateway(reconnect=False)',
+            'vcdObj.reconnectServiceUplinkVnics()',  # PATCH-15: then the NSX-V vNICs get them back
             'vcdObj.reconnectOrDisconnectSourceEdgeGateway(sourceEdgeGatewayId, connect=True)',
             'vcdObj.connectUplinkSourceEdgeGateway(sourceEdgeGatewayId, rollback=True)',
             'vcdObj.disconnectSourceOrgVDCNetwork(orgVDCNetworkList, sourceEdgeGatewayId, rollback=True)',
@@ -76,6 +79,7 @@ class Rollback:
             'vcdObj.rollbackCatalogMoves()',
             'vcdObj.deleteOrgVDCNetworks(targetOrgVDCId, rollback=True)',
             'vcdObj.deleteNsxTBackedOrgVDCEdgeGateways(targetOrgVDCId)',
+            'vcdObj.deleteServiceUplinkNetworks(nsxtObj)',  # PATCH-15
             'vcdObj.releaseFloatingIps()',
             'vcdObj.releaseIpPrefixes()',
             'vcdObj.deleteIpPrefixAddedToIpSpaceUplinks()',
@@ -86,6 +90,14 @@ class Rollback:
             'vcdObj.deleteOrgVDC(targetOrgVDCId, rollback=True)',
             'vcdObj.resetTargetExternalNetwork()',
         ]
+
+        # PATCH-16: only these task expressions are ever executed, also when the remaining tasks come from metadata
+        self.allowedTasks = frozenset(self.preRollbackTasks + self.rollbackTaskDfw + self.rollbackTask)
+
+    def _checkTask(self, task):
+        """PATCH-16: refuses a rollback task that is not one of the tool's own task expressions."""
+        if task not in self.allowedTasks:
+            raise Exception("Rollback task '{}' from metadata is not a known rollback task - not executed".format(task))
 
     def perform(self, vcdObj, nsxtObj, vcdObjList, rollbackTasks=None, preRollback=False):
         """
@@ -139,6 +151,7 @@ class Rollback:
                     # Performing rollback task
                     threading.current_thread().name = vcdObj.orgVdcInput["OrgVDCName"]
 
+                    self._checkTask(rollbackTask)
                     eval(rollbackTask)
                     # Removing task from rollback tasks left list after the task has been performed successfully
                     rollbackTasksLeft.pop(0)
@@ -205,6 +218,7 @@ class Rollback:
             for rollbackTask in listOfRollbackTasks:
                 # Performing rollback task
                 threading.current_thread().name = vcdObj.orgVdcInput["OrgVDCName"]
+                self._checkTask(rollbackTask)
                 eval(rollbackTask)
 
                 # Removing task from rollback tasks left list after the task has been performed successfully and

@@ -13,6 +13,7 @@ from functools import wraps
 import inspect
 import logging
 import json
+import urllib.parse  # PATCH-16
 import os
 import re
 import requests
@@ -96,6 +97,41 @@ class NSXTOperations():
         self.apiVersion = None
         self.edgeClusterNameList = edgeClusterNameList
 
+    @staticmethod
+    def _errorText(response):
+        """PATCH-17: the error message of an NSX-T response (JSON 'error_message', else the response text)."""
+        try:
+            return (response.json() or {}).get('error_message') or response.text[:300]
+        except ValueError:
+            return response.text[:300]
+
+    def _getAllPages(self, url):
+        """
+        PATCH-16: GET with NSX-T cursor paging. For list responses 'results' holds the items of every page.
+        Returns None when the first page is not 200 (as before); a failing later page raises instead of
+        returning a partial list.
+        """
+        response = self.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
+        if response.status_code != requests.codes.ok:
+            return None
+        body = json.loads(response.content)
+        if not isinstance(body, dict) or nsxtConstants.NSX_API_RESULTS_KEY not in body:
+            return body
+        results = list(body.get(nsxtConstants.NSX_API_RESULTS_KEY) or [])
+        cursor, seen = body.get('cursor'), set()
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            pageUrl = '{}{}cursor={}'.format(url, '&' if '?' in url else '?', urllib.parse.quote(str(cursor), safe=''))
+            page = self.restClientObj.get(url=pageUrl, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
+            if page.status_code != requests.codes.ok:
+                raise Exception("Failed to read the next page of {} (HTTP {})".format(url, page.status_code))
+            pageBody = json.loads(page.content)
+            results.extend(pageBody.get(nsxtConstants.NSX_API_RESULTS_KEY) or [])
+            cursor = pageBody.get('cursor')
+        body[nsxtConstants.NSX_API_RESULTS_KEY] = results
+        body.pop('cursor', None)
+        return body
+
     def getComponentData(self, componentApi, componentName=None, usePolicyApi=False):
         """
         Description   : This function validates the presence of the component in NSX-T
@@ -110,10 +146,9 @@ class NSXTOperations():
                 url = "{}{}".format(nsxtConstants.NSXT_HOST_POLICY_API.format(self.ipAddress), componentApi)
             else:
                 url = nsxtConstants.NSXT_HOST_API_URL.format(self.ipAddress, componentApi)
-            response = self.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
-            if response.status_code == requests.codes.ok:
-                responseData = json.loads(response.content)
-                if nsxtConstants.NSX_API_RESULTS_KEY in responseData.keys():
+            responseData = self._getAllPages(url)  # PATCH-16: every page, not only the first
+            if responseData is not None:
+                if isinstance(responseData, dict) and nsxtConstants.NSX_API_RESULTS_KEY in responseData.keys():
                     responseData = responseData[nsxtConstants.NSX_API_RESULTS_KEY]
                 # If componentName not provided return the whole response dict
                 if not componentName:
@@ -145,10 +180,9 @@ class NSXTOperations():
                 nsxtConstants.NSXT_HOST_POLICY_API.format(self.ipAddress),
                 nsxtConstants.SEGMENT_DETAILS)
 
-            response = self.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
-            if response.status_code == requests.codes.ok:
-                responseData = json.loads(response.content)
-                if nsxtConstants.NSX_API_RESULTS_KEY in responseData.keys():
+            responseData = self._getAllPages(url)  # PATCH-16: every page, not only the first
+            if responseData is not None:
+                if isinstance(responseData, dict) and nsxtConstants.NSX_API_RESULTS_KEY in responseData.keys():
                     responseData = responseData[nsxtConstants.NSX_API_RESULTS_KEY]
                 # If componentName not provided return the whole response dict
                 if not componentName:
@@ -1394,7 +1428,8 @@ class NSXTOperations():
                     if usedNode:
                         freeTransportNodesList.pop()
                 else:
-                    raise Exception('Failed to fetch transport node details with error - {}'.format(responseDict["error_message"]))
+                    # PATCH-17: the error of this response, not a previous one (or an undefined name)
+                    raise Exception('Failed to fetch transport node details with error - {}'.format(self._errorText(response)))
 
             logger.debug(
                 "freeTransportNodesList = {}".format(
@@ -1474,7 +1509,7 @@ class NSXTOperations():
                 responseDict = response.json()
             else:
                 raise Exception(
-                    'Failed to fetch transport node details with error - {}'.format(responseDict["error_message"]))
+                    'Failed to fetch transport node details with error - {}'.format(self._errorText(response)))  # PATCH-17
             if not responseDict.get('tags'):
                 responseDict['tags'] = []
             responseDict['tags'] = [tag for tag in responseDict['tags'] if (tag["scope"], tag["tag"]) not in listify(tagToRemove)] + \
@@ -1943,9 +1978,10 @@ class NSXTOperations():
                 segment['transport_zone_path']),
             headers=nsxtConstants.NSXT_API_HEADER,
             auth=self.restClientObj.auth)
-        tz = response.json()
         if not response.status_code == requests.codes.ok:
-            raise Exception(f"Failed to get details of transport zone: {tz['transport_zone_path']}: {tz['error_message']}")
+            # PATCH-17: the path comes from the segment (the error response has no 'transport_zone_path')
+            raise Exception(f"Failed to get details of transport zone: {segment['transport_zone_path']}: {self._errorText(response)}")
+        tz = response.json()
 
         if tz['tz_type'] == 'OVERLAY_STANDARD':
             return True
@@ -1961,19 +1997,29 @@ class NSXTOperations():
                             nsxtConstants.NSXT_QOS_PROFILE.format(qosProfileName))
         burstSize = int(qosProfileName) * 6250
         intentPath = nsxtConstants.NSXT_QOS_PROFILE.format(qosProfileName)
-        payloadDict = {"display_name": "{} Mbps".format(qosProfileName),
-                       "description": "Rate profile created during NSX-V to T migration",
-                       "burst_size": burstSize,
-                       "committed_bandwitdth": qosProfileName,
-                       "excess_action": "DROP"}
-        payloadData = json.dumps(payloadDict)
-        # create QOS profile for the rate limit
-        response = self.restClientObj.patch(url=url, headers=nsxtConstants.NSXT_API_HEADER,
-                                            auth=self.restClientObj.auth, data=str(payloadData))
-        if not response.status_code == requests.codes.ok:
-            raise Exception("Failed to create NSXT-Manager QOS profiles : {}".format(response.json()))
-        self.checkRealizedState(intentPath)
-        logger.debug("QOS profile {} created successfully.".format(qosProfileName))
+        # PATCH-17: bandwidth as an integer in 'committed_bandwidth'; 'committed_bandwitdth' is the deprecated spelling,
+        # used only when the profile reads back without the value (older NSX-T)
+        bandwidth = int(qosProfileName)
+        for field in ("committed_bandwidth", "committed_bandwitdth"):
+            payloadDict = {"display_name": "{} Mbps".format(qosProfileName),
+                           "description": "Rate profile created during NSX-V to T migration",
+                           "burst_size": burstSize,
+                           field: bandwidth,
+                           "excess_action": "DROP"}
+            payloadData = json.dumps(payloadDict)
+            # create QOS profile for the rate limit
+            response = self.restClientObj.patch(url=url, headers=nsxtConstants.NSXT_API_HEADER,
+                                                auth=self.restClientObj.auth, data=str(payloadData))
+            if not response.status_code == requests.codes.ok:
+                raise Exception("Failed to create NSXT-Manager QOS profiles : {}".format(response.text[:300]))
+            self.checkRealizedState(intentPath)
+            readBack = self.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
+            if readBack.status_code == requests.codes.ok:
+                profile = readBack.json()
+                if bandwidth in (profile.get("committed_bandwidth"), profile.get("committed_bandwitdth")):
+                    logger.debug("QOS profile {} created successfully.".format(qosProfileName))
+                    return
+        raise Exception("QOS profile {} does not read back with committed bandwidth {} Mbps".format(qosProfileName, bandwidth))
 
     def getVRFdetails(self, vrfBackingId):
         """
@@ -1985,11 +2031,10 @@ class NSXTOperations():
         url = "{}{}".format(nsxtConstants.NSXT_HOST_POLICY_API.format(self.ipAddress),
                             nsxtConstants.GET_LOCALE_SERVICES_API.format(vrfId))
         response = self.restClientObj.get(url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
-        responseDict = response.json()
         if response.status_code == requests.codes.ok:
-            vrfData = responseDict
+            vrfData = response.json()
             return vrfData
-        raise Exception("Failed to get VRF details with error - {}".format(responseDict["error_message"]))
+        raise Exception("Failed to get VRF details with error - {}".format(self._errorText(response)))  # PATCH-17
 
     def createRouteRedistributionRule(self, vrfData, t0Gateway, routeRedistributionRules):
         """

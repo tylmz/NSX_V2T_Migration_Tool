@@ -55,47 +55,46 @@ class Thread:
             Description: This method executes the threads.
             Returns: True
         """
-        try:
-            while not self.threadQueue.empty():
-                function, saveOutputKey, block, threadName, arguments = self.threadQueue.get(timeout=10, block=False)
+        # PATCH-16: an empty queue ends the worker (no check-then-get race), and every job taken from the queue is
+        # acknowledged exactly once with task_done(), whatever the job does
+        while True:
+            try:
+                function, saveOutputKey, block, threadName, arguments = self.threadQueue.get(block=False)
+            except Empty:
+                return True
+            try:
                 # If thread name is provided, set name of thread to that name
                 if threadName:
                     threading.current_thread().name = threadName
                 _args, _kwargs = arguments
-                try:
-                    output = function(*_args, **_kwargs)
-                    # saving return value from function
-                    if saveOutputKey:
-                        self.returnValues[saveOutputKey] = output
-                    else:
-                        self.returnValues[function.__name__] = output
-                except Empty:
-                    continue
-                except Exception as err:
-                    if kwargs.get('logException'):
-                        logging.exception(err)
-                    else:
-                        logger.error(f"Error: {str(err)}")
-                        logger.debug(traceback.format_exc())
-                    # set the value of stop flag to true in case of any exception
-                    self.stopValue = True
-                    # Acknowledge the task done
-                    self.threadQueue.task_done()
-                    # if block param is provided then empty the queue in case of failure
-                    if block:
-                        # Acquiring the lock to clear the queue
-                        self.acquireLock()
-                        while not self.threadQueue.empty():
-                            self.threadQueue.get(block=False)
-                            self.threadQueue.task_done()
-                        # Releasing the lock after queue is empty
-                        self.releaseLock()
-                        return
+                output = function(*_args, **_kwargs)
+                # saving return value from function
+                if saveOutputKey:
+                    self.returnValues[saveOutputKey] = output
                 else:
-                    self.threadQueue.task_done()
-            return True
-        except:
-            raise
+                    self.returnValues[function.__name__] = output
+            except Empty:
+                pass  # as before: a job raising queue.Empty is not treated as a failure
+            except Exception as err:
+                if kwargs.get('logException'):
+                    logging.exception(err)
+                else:
+                    logger.error(f"Error: {str(err)}")
+                    logger.debug(traceback.format_exc())
+                # set the value of stop flag to true in case of any exception
+                self.stopValue = True
+                # if block param is provided then empty the queue in case of failure
+                if block:
+                    with self.lock:
+                        while True:
+                            try:
+                                self.threadQueue.get(block=False)
+                            except Empty:
+                                break
+                            self.threadQueue.task_done()
+                    return
+            finally:
+                self.threadQueue.task_done()
 
     def spawnThread(self, func, *args, saveOutputKey=None, block=False, threadName=None, **kwargs):
         """

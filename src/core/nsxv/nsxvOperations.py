@@ -7,10 +7,10 @@ Description: NSXT Module which performs the NSX-V related Operations
 """
 
 import logging
-import os
 import re
 import requests
 import subprocess
+import threading  # PATCH-16
 
 from src.commonUtils.certUtils import generateRSAKey, decryptCertPrivateKey, decryptSessionKey
 import src.core.nsxv.nsxvConstants as nsxvConstants
@@ -35,7 +35,7 @@ class NSXVOperations():
         self.password = password
         self.username = username
         self.verify = verify
-        self.pemFileName = 'privateKey.pem'
+        self._threadKeys = threading.local()  # PATCH-16: per-thread private key hand-over, no files
 
     def login(self):
         """
@@ -51,11 +51,18 @@ class NSXVOperations():
             if response.status_code == requests.codes.ok:
                 logger.debug("Successfully logged into NSX-V {}".format(self.ipAddress))
             elif response.status_code == requests.codes.forbidden:
-                errorMsg = re.findall('Message</b>(.*?)</p>', response.text)[0]
+                messages = re.findall('Message</b>(.*?)</p>', response.text)
+                errorMsg = messages[0] if messages else response.text[:200]
                 if re.search(r'Bad Username or Credentials presented', errorMsg):
                     raise Exception('Failed to login to NSX-V {} with the given credentials.'.format(self.ipAddress))
                 else:
                     raise Exception('Login failed to NSX-V due to error - {}'.format(errorMsg))
+            elif response.status_code == requests.codes.unauthorized:
+                # PATCH-17: rejected credentials go to the retry prompt like a 403 with bad credentials
+                raise Exception('Failed to login to NSX-V {} with the given credentials.'.format(self.ipAddress))
+            else:
+                # PATCH-17: any other status is a failed login, not a successful one
+                raise Exception('Login failed to NSX-V {} (HTTP {})'.format(self.ipAddress, response.status_code))
         except Exception:
             raise
 
@@ -166,25 +173,25 @@ class NSXVOperations():
             logger.debug('Decrypting certificate private key using decrypted secret key')
             decryptedPrivateKey = decryptCertPrivateKey(enc_private_key, secret)
 
-            # Writing decrypted private key to file
-            logger.debug('Writing decrypted private key to {} file'.format(self.pemFileName))
-            with open(self.pemFileName, 'w', encoding='utf-8') as private_file:
-                private_file.write(decryptedPrivateKey)
-
-            # file name to be used to convert pkcs1 pem file to pkcs8 file
-            pkcs8PemFileName = 'privateKeyPKCS8.pem'
-            list_files = subprocess.run(
-                ["openssl", "pkcs8", "-topk8", "-inform", "PEM", "-outform", "PEM", "-in", self.pemFileName, "-out",
-                 pkcs8PemFileName, "-nocrypt"])
-            if list_files.returncode:
-                raise Exception('Failed to convert pkcs1 private key to pkcs2 private key')
-            os.remove(self.pemFileName)
+            # PATCH-16: the key is converted to PKCS#8 through openssl's stdin/stdout - it is never written to a
+            # file - and kept only for the calling thread until uploadCertificate takes it
+            conversion = subprocess.run(["openssl", "pkcs8", "-topk8", "-inform", "PEM", "-outform", "PEM", "-nocrypt"],
+                                        input=decryptedPrivateKey.encode('utf-8'), stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+            if conversion.returncode or not conversion.stdout:
+                raise Exception('Failed to convert pkcs1 private key to pkcs8 private key')
+            self._threadKeys.pkcs8 = conversion.stdout.decode('utf-8')
             return certificate
         except:
             raise
-        finally:
-            if os.path.exists(self.pemFileName):
-                os.remove(self.pemFileName)
+
+    def takePrivateKey(self):
+        """PATCH-16: the PKCS#8 private key retrieved by certRetrieval in this thread (removed once taken)."""
+        key = getattr(self._threadKeys, 'pkcs8', None)
+        self._threadKeys.pkcs8 = None
+        if not key:
+            raise Exception('No private key retrieved from NSX-V in this thread')
+        return key
 
     def getNsxvVniPoolIds(self):
         """

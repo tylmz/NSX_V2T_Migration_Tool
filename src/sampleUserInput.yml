@@ -27,6 +27,8 @@ VCloudDirector:
       NonDistributedNetworks: False # (optional) Option to enable the non-distributed routing for routed OrgVDC network.
       serviceNetworkDefinition: 192.168.255.225/27 # (Optional) Option to set service Network Definition for edgeGateway to be used for DNS forwarding and DHCP server networking services running on Tier1 Gateway
       SkipBGPMigration: False # (Optional) Option to skip BGP migration
+      # TransportSubnets: [172.31.0.0/12]          # (Optional, community build) transport subnets not migrated
+      # DmzStaticRoutes: [203.0.113.0/24]        # (Optional, community build) public blocks that get Tier-0 routes
       EdgeGateways:
         # (Optional): All the following fields are optional.
         # Provide these values only if the value provided at OrgVDC level needs to be overridden.
@@ -43,6 +45,12 @@ VCloudDirector:
           AdvertiseRoutedNetworks: False
           NonDistributedNetworks: False
           serviceNetworkDefinition: 192.168.255.225/27
+          # Tier1StaticRoutes:                     # (community build) required when the edge has static routes:
+          #   - {network: 203.0.113.240/29, nextHop: 10.20.30.3}   # list exactly the ESG's routes
+          #   - {network: 10.50.0.0/16, nextHop: 10.200.0.1, adminDistance: 1}
+          # ServiceUplinks:                        # (Optional, community build) interfaces added outside VCD
+          #   VlanTransportZone: TZ-VLAN-Customer
+          #   Uplinks: auto                        # or [{portgroup: MPLS-PG, gateway: 10.200.0.1, vlanId: 1234}]
         EdgeGateway2Name: # Replace `EdgeGateway2Name` with exact Edge Gateway name from the VCD
           Tier0Gateways: tpm-externalnetwork
           NoSnatDestinationSubnet:

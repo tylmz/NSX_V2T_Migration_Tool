@@ -527,8 +527,17 @@ class VMwareCloudDirectorNSXMigratorV2T:
 
             # Iterating over the org in the relation map
             for org in relationMap:
-                orgId = self.vcdValidationObj.getOrgId(org).split(":")[-1]
-                sharedOrgVdcList, orgVDCUsingSameDCGroup = self.vcdValidationObj.getListOfOrgVdcUsingSharedNetwork(orgId)
+                # PATCH-17: an organization that does not exist ('NA' for VDC names that were not found) gives report
+                # rows with status 'Org VDC not present' instead of stopping the whole assessment
+                orgMissing, orgError = False, None
+                try:
+                    orgId = self.vcdValidationObj.getOrgId(org).split(":")[-1]
+                    sharedOrgVdcList, orgVDCUsingSameDCGroup = self.vcdValidationObj.getListOfOrgVdcUsingSharedNetwork(orgId)
+                except Exception as err:
+                    # 'NA' holds Org VDC names not found in VCD; any other failure is reported as not accessible
+                    orgError = None if org == 'NA' else str(err)
+                    self.logger.debug(f"Organization '{org}' could not be read - {err}")
+                    orgMissing, sharedOrgVdcList, orgVDCUsingSameDCGroup = True, [], []
 
                 # Iterating over the org vdc's in the relation map
                 for VDC, VDCId in relationMap[org].items():
@@ -569,13 +578,18 @@ class VMwareCloudDirectorNSXMigratorV2T:
                     for key, value in VALIDATION_CLASSIFICATION.items():
                         orgVDCResult[key] = "NA"
 
-                    # If Org VDC is not present when its turn came, skip VDC silently.
+                    # If Org VDC is not present when its turn came, report it as not present (PATCH-17: the row is kept)
                     try:
+                        if orgMissing:
+                            raise Exception(f"Organization '{org}' not found")
                         orgUrl = self.vcdValidationObj.getOrgUrl(org)
                         self.vcdValidationObj.getOrgVDCUrl(orgUrl, VDC, saveResponse=True)
                     except:
-                        # TODO pranshu: capture specific error which suggest orgVDC not present
-                        orgVDCResult['Status'] = STATUS_CODES[50]
+                        orgVDCResult['Status'] = STATUS_CODES[40] if orgError else STATUS_CODES[50]
+                        self.consoleLogger.warning(f"Org VDC '{VDC}' of organization '{org}' not evaluated - " +
+                                                   (f"organization could not be read: {orgError}" if orgError else "not present"))
+                        self.changeLoggingFormat(f"{VDC}:{org}", restore=True)
+                        self.reportData.append(orgVDCResult)
                         continue
 
                     orgVDCResult['VMs'] = vmData[org][VDC]['numberOfVMs']
@@ -890,6 +904,11 @@ class VMwareCloudDirectorNSXMigratorV2T:
             # Filename of detailed report file
             detailedReportfilename = os.path.join(self.vcdBasePath,
                                                   f'v2tAssessmentReport-{self.currentDateTime}.csv')
+
+            # PATCH-17: nothing to report (no Org VDC matched the input)
+            if not self.reportData:
+                self.consoleLogger.warning("No Org VDC was assessed - no report written")
+                return
 
             # Writing data to detailed report csv
             with open(detailedReportfilename, "w", encoding='utf-8', newline='') as f:

@@ -6,6 +6,7 @@
 Description: Module which contains all the utilities required for VMware Cloud Director migration from NSX-V to NSX-T
 """
 
+import ast  # PATCH-16
 import json
 import logging
 import os
@@ -16,9 +17,42 @@ import certifi
 import jinja2
 import yaml
 import xmltodict
+from collections import OrderedDict  # PATCH-16
 from xml.sax.saxutils import escape
 
 logger = logging.getLogger('mainLogger')
+
+
+def safeLiteral(text):
+    """
+    PATCH-16: converts a stored Python literal (metadata value) back to its object without executing code.
+    Accepts what the tool writes: str/bytes/numbers/bool/None, lists, tuples, dicts, sets and the
+    constructors OrderedDict(...), set(...), frozenset(...). Anything else raises ValueError.
+    """
+    allowedCalls = {'OrderedDict': OrderedDict, 'set': set, 'frozenset': frozenset}
+
+    def convert(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Tuple):
+            return tuple(convert(item) for item in node.elts)
+        if isinstance(node, ast.List):
+            return [convert(item) for item in node.elts]
+        if isinstance(node, ast.Set):
+            return {convert(item) for item in node.elts}
+        if isinstance(node, ast.Dict):
+            return {convert(key): convert(value) for key, value in zip(node.keys, node.values)}
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            value = convert(node.operand)
+            if not isinstance(value, (int, float, complex)) or isinstance(value, bool):
+                raise ValueError('unsupported unary operand')
+            return -value if isinstance(node.op, ast.USub) else value
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in allowedCalls \
+                and not node.keywords and len(node.args) <= 1:
+            return allowedCalls[node.func.id](*[convert(arg) for arg in node.args])
+        raise ValueError('unsupported expression {}'.format(type(node).__name__))
+
+    return convert(ast.parse(str(text).strip(), mode='eval').body)
 
 
 def listify(_list):

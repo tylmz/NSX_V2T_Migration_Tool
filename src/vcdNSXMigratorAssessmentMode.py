@@ -133,7 +133,8 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
             if threadObj.returnValues['dummyNetwork'] and isinstance(threadObj.returnValues['dummyNetwork'], Exception):
                 validationFailures.append([getDummyExternalNetworkDesc.format(self.inputDict["VCloudDirector"]["DummyExternalNetwork"]), threadObj.returnValues['dummyNetwork'], 'Failed'])
             if threadObj.returnValues['getNSXVOrgVdcNetwork'] and isinstance(threadObj.returnValues['getNSXVOrgVdcNetwork'], Exception):
-                validationFailures.append([getOrgVdcNetworkDesc, threadObj.returnValues['getNSXVOrgVdcNetwork', 'Failed']])
+                # PATCH-17: the exception and the status are two columns (was a tuple-key lookup that raised KeyError)
+                validationFailures.append([getOrgVdcNetworkDesc, threadObj.returnValues['getNSXVOrgVdcNetwork'], 'Failed'])
             orgVdcNetworkList = threadObj.returnValues['getNSXVOrgVdcNetwork']
 
             # Validation methods reference
@@ -451,12 +452,15 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
                     # Storing the assessment table output in string format
                     sharedNetworkCheckTable = getSharedNetworkExceptionObj.get_string()
                     precheckLogger.info('Validation Checks Failed for Shared Networks\n{}\n'.format(sharedNetworkCheckTable))
-                elif float(self.vcdObjList[0].version) >= float(vcdConstants.API_VERSION_ANDROMEDA) and not orgExceptionList:
+                # PATCH-17: org detail errors of every org VDC count, not only those of the last loop iteration
+                elif float(self.vcdObjList[0].version) >= float(vcdConstants.API_VERSION_ANDROMEDA) and \
+                        not any(errors[1] for errors in self.orgVDCerrors.values()):
                     precheckLogger.info(f'All shared networks related validations successfully for org vdc/s - {", ".join([vdc["OrgVDCName"] for vdc in self.inputDict["VCloudDirector"]["SourceOrgVDC"]])}.\n')
 
                 # Check if any org vdc encountered any error in validations
-                if reduce(lambda a, b: a + b,
-                          [errors[0] + errors[1] for errors in self.orgVDCerrors.values()]) + self.bridgingCheckFailures:
+                # PATCH-17: shared network failures count too, and an empty result set no longer raises in reduce()
+                if [error for errors in self.orgVDCerrors.values() for error in errors[0] + errors[1]] + \
+                        self.bridgingCheckFailures + list(self.sharedNetworkCheckFailures or []):
                     self.consoleLogger.error("Assessment mode for NSX-V migration to NSX-T failed")
                     self.consoleLogger.error(
                         'Check {} file for failed validations.'.format(self.preAssessmentLogs))

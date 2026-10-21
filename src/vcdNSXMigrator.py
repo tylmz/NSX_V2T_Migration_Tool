@@ -148,6 +148,15 @@ class VMwareCloudDirectorNSXMigrator():
         # if rollback argument is provided then rollback is retried from its last failed state
         self.retryRollback = args.rollback
 
+        # PATCH-17: argument checks that need no input file come before reading it (the input path was opened before
+        # the "no arguments" check, which failed on a missing --filepath)
+        if not any(args.__dict__.values()):
+            parser.print_help()
+            os._exit(0)
+        if not args.filePath:
+            parser.print_help()
+            raise Exception("Invalid Input Arguments: --filepath is required")
+
         self.renderInputFile()
 
         # Initialize logger object with the migrator execution mode
@@ -155,11 +164,6 @@ class VMwareCloudDirectorNSXMigrator():
         self.consoleLogger = logging.getLogger("consoleLogger")
         self.mainLogfile = logging.getLogger('mainLogger').handlers[0].baseFilename
 
-        # Check if no arguments are passed
-        if not any(args.__dict__.values()):
-            # If no args are provided show only help
-            parser.print_help()
-            os._exit(0)
         # Check if invalid arguments are passed
         if (not args.cleanupValue and not args.filePath) or \
             (not args.filePath and args.cleanupValue) or \
@@ -220,7 +224,7 @@ class VMwareCloudDirectorNSXMigrator():
                 self.inputDict.get('NSXV', {}).get('Common', {}).get('username', None)) or \
                 (getattr(self.inputDict, 'NSXVUsername', None) and getattr(self.inputDict, 'NSXVIpaddress', None)):
             self.nsxvPassword = getpass.getpass(prompt="Please enter NSX-V Password: ")
-            if not self.nsxtPassword:
+            if not self.nsxvPassword:  # PATCH-17: was checking the NSX-T password
                 raise ValueError("NSX-V password must be provided")
         else:
             self.nsxvPassword = str()
@@ -282,7 +286,7 @@ class VMwareCloudDirectorNSXMigrator():
                     self.nsxvPassword = self.passwordUtils.decrypt(decryptionKey, nsxvPassword.encode())
                 else:
                     self.consoleLogger.error("Incorrect password file path")
-                    os._exit(0)
+                    os._exit(1)  # PATCH-16: failure exit code
             # if password file path id not provided
             else:
                 if self.loginErrorDict[self._loginToVcd.__name__] is False:
@@ -295,6 +299,56 @@ class VMwareCloudDirectorNSXMigrator():
                     self._getNsxvPassword()
         except:
             raise
+
+    @staticmethod
+    def _validateTier1StaticRoutes(value, key, errorInputDict):
+        """PATCH-14: a list of {network, nextHop, adminDistance (optional), description (optional)}."""
+        if value is None:
+            return
+        if not isinstance(value, list):
+            errorInputDict[key] = "Must be a list of {network, nextHop} entries"
+            return
+        for item in value:
+            if not isinstance(item, dict):
+                errorInputDict[key] = "Each entry must be {{network, nextHop}}; got '{}'".format(item)
+                return
+            try:
+                network = ipaddress.ip_network(str(item.get('network')).strip(), strict=False)
+                nextHop = ipaddress.ip_address(str(item.get('nextHop')).strip())
+                if network.version != nextHop.version:
+                    raise ValueError
+                if item.get('adminDistance') is not None and not 1 <= int(item['adminDistance']) <= 255:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errorInputDict[key] = "Invalid route {}".format(item)
+                return
+
+    @staticmethod
+    def _validateServiceUplinks(value, key, errorInputDict):
+        """PATCH-15: {VlanTransportZone, UplinkTeamingPolicy (optional), Uplinks: auto | [{portgroup, gateway, vlanId}]}."""
+        if value is None:
+            return
+        if not isinstance(value, dict) or not value.get('VlanTransportZone'):
+            errorInputDict[key] = "Must contain 'VlanTransportZone' (and optionally 'Uplinks', 'UplinkTeamingPolicy')"
+            return
+        uplinks = value.get('Uplinks', 'auto')
+        if uplinks == 'auto':
+            return
+        if not isinstance(uplinks, list):
+            errorInputDict[key] = "'Uplinks' must be 'auto' or a list"
+            return
+        for item in uplinks:
+            if not isinstance(item, dict) or not item.get('portgroup'):
+                errorInputDict[key] = "Each entry of 'Uplinks' needs 'portgroup'"
+                return
+            try:
+                if item.get('gateway'):
+                    ipaddress.ip_address(str(item['gateway']).strip())
+                if item.get('vlanId') is not None and not 1 <= int(item['vlanId']) <= 4094:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errorInputDict[key] = "Invalid entry {}".format(item)
+                return
 
     def inputValidation(self):
         """
@@ -361,6 +415,17 @@ class VMwareCloudDirectorNSXMigrator():
                                     except ValueError:
                                         errorInputDict["{}['{}']".format(dictKey, listKey)] = \
                                             "Invalid CIDR '{}'".format(cidr)
+                            # PATCH-14/15: Tier1StaticRoutes and ServiceUplinks are set per edge gateway
+                            if 'Tier1StaticRoutes' in sourceOrgVdc:
+                                errorInputDict["{}['Tier1StaticRoutes']".format(dictKey)] = \
+                                    "Set 'Tier1StaticRoutes' per edge gateway under 'EdgeGateways'"
+                            for edgeName, edgeValues in (sourceOrgVdc.get('EdgeGateways') or {}).items():
+                                edgeKey = "{}['EdgeGateways']['{}']".format(dictKey, edgeName)
+                                edgeValues = edgeValues or {}
+                                self._validateTier1StaticRoutes(edgeValues.get('Tier1StaticRoutes'),
+                                                                edgeKey + "['Tier1StaticRoutes']", errorInputDict)
+                                self._validateServiceUplinks(edgeValues.get('ServiceUplinks'),
+                                                             edgeKey + "['ServiceUplinks']", errorInputDict)
 
         if not isinstance(self.inputDict['VCloudDirector'].get('SourceOrgVDC'), list):
             errorInputDict["VCloudDirector['SourceOrgVDC']"] = 'Value should be list'
@@ -395,6 +460,8 @@ class VMwareCloudDirectorNSXMigrator():
                 vcdObject.password = self.vCloudDirectorPassword
                 vcdObject.vcdLogin()
             self.loginErrorDict[self._loginToVcd.__name__] = True
+            # PATCH-17: only after a successful login (a credential failure goes to the retry prompt)
+            self.consoleLogger.info('VMware Cloud Director Version - {}'.format(self.vcdObjList[0].getVCDVersion()))
         except Exception as err:
             logging.error(str(err))
             logging.debug(traceback.format_exc())
@@ -402,7 +469,6 @@ class VMwareCloudDirectorNSXMigrator():
                 self.loginErrorDict[self._loginToVcd.__name__] = False
             else:
                 raise
-        self.consoleLogger.info('VMware Cloud Director Version - {}'.format(self.vcdObjList[0].getVCDVersion()))
 
     def _loginToNsxv(self):
         """
@@ -414,6 +480,8 @@ class VMwareCloudDirectorNSXMigrator():
                 self.nsxvObj.password = self.nsxvPassword
                 self.nsxvObj.login()
                 self.loginErrorDict[self._loginToNsxv.__name__] = True
+                # PATCH-17: only after a successful login
+                self.consoleLogger.info('NSX-V Version - {}'.format(self.nsxvObj.getNsxvVersion()))
             except Exception as err:
                 logging.error(str(err))
                 logging.debug(traceback.format_exc())
@@ -421,7 +489,6 @@ class VMwareCloudDirectorNSXMigrator():
                     self.loginErrorDict[self._loginToNsxv.__name__] = False
                 else:
                     raise
-            self.consoleLogger.info('NSX-V Version - {}'.format(self.nsxvObj.getNsxvVersion()))
         else:
             self.loginErrorDict[self._loginToNsxv.__name__] = True
 
@@ -436,6 +503,8 @@ class VMwareCloudDirectorNSXMigrator():
                 nsxtObj.getComputeManagers()
                 nsxtObj.getNsxtAPIVersion()
             self.loginErrorDict[self._loginToNsxt.__name__] = True
+            # PATCH-17: only after a successful login
+            self.consoleLogger.info('NSX-T Version - {}'.format(self.nsxtObjList[0].getNsxtVersion()))
         except Exception as err:
             logging.error(str(err))
             logging.debug(traceback.format_exc())
@@ -443,7 +512,6 @@ class VMwareCloudDirectorNSXMigrator():
                 self.loginErrorDict[self._loginToNsxt.__name__] = False
             else:
                 raise
-        self.consoleLogger.info('NSX-T Version - {}'.format(nsxtObj.getNsxtVersion()))
 
     def _loginToVcenter(self):
         """
@@ -501,12 +569,12 @@ class VMwareCloudDirectorNSXMigrator():
                 if False in self.loginErrorDict.values():
                     self.consoleLogger.error(
                         'Unable to proceed due to incorrect credentials. Please enter valid credentials')
-                    os._exit(0)
+                    os._exit(1)  # PATCH-16: failure exit code
             # If login has failed and password file is not provided
             elif False in self.loginErrorDict.values() and not self.passFile:
                 self.consoleLogger.error(
                     'Unable to proceed due to incorrect credentials. Please enter valid credentials')
-                os._exit(0)
+                os._exit(1)  # PATCH-16: failure exit code
             else:
                 if not self.passFile:
                     self._encryptAndSavePasswords()
@@ -739,11 +807,11 @@ class VMwareCloudDirectorNSXMigrator():
             # checking for certificate path is present in user input
             if not certPath:
                 self.consoleLogger.error("Please enter the certificate path in user Input file.")
-                os._exit(0)
+                os._exit(1)  # PATCH-16: failure exit code
             # checking for the path provided in user input whether its valid
             if not os.path.exists(certPath):
                 self.consoleLogger.error("The provided certificate path in user Input file does not exist.")
-                os._exit(0)
+                os._exit(1)  # PATCH-16: failure exit code
             # update certificate path in requests
             self.utils.updateRequestsPemCert(certPath)
 
@@ -788,6 +856,10 @@ class VMwareCloudDirectorNSXMigrator():
                                       self.nsxvPassword, self.inputDict.get("NSXV", {})["Common"]["verify"])
         else:
             self.nsxvObj = NSXVOperations()
+
+        # PATCH-15: VCD objects use NSX-V Manager for edge interfaces added outside VCD (ServiceUplinks)
+        for vcdObj in self.vcdObjList:
+            vcdObj.nsxvObj = self.nsxvObj
 
         # initializing vcenter Api class
         self.vcenterObj = VcenterApi(self.inputDict["Vcenter"]["Common"]["ipAddress"], self.inputDict["Vcenter"]["Common"]["username"],
@@ -1030,6 +1102,8 @@ class VMwareCloudDirectorNSXMigrator():
         """
         Description : This method runs the migration process of VMware Cloud Director from V2T
         """
+        # PATCH-16: process exit code - 0 success, 1 failure, 130 aborted
+        self.exitCode = 0
         try:
             # read release version
             self.releaseVersion()
@@ -1080,19 +1154,23 @@ class VMwareCloudDirectorNSXMigrator():
             # using regex getting the first match of () to get host ip
             host = re.findall(r'\'(.*?)\'', str(e))
             self.consoleLogger.error('Certificate Validation Failed. Unable to login - {}.'.format(host[0]))
+            self.exitCode = 1
         except requests.exceptions.ConnectionError as e:
             # catching the exception for ssl error.
             # exception of HTTPSConnectionPool(host={hostname}, port=443)
             # using regex getting the first match of string within '()' to get host ip
             host = re.findall(r'\'(.*?)\'', str(e))
             self.consoleLogger.error('Connection Failed. Unable to connect to remote server - {}.'.format(host[0]))
+            self.exitCode = 1
         except KeyboardInterrupt:
             self.consoleLogger.error('Aborting the VCD NSX Migrator tool execution')
+            self.exitCode = 130
         except Exception as err:
             logging.debug(traceback.format_exc())
             self.consoleLogger.exception(err)
             self.consoleLogger.critical("VCD V2T Migration Tool failed due to errors. For more details, please refer "
                                         "main log file {}".format(self.mainLogfile))
+            self.exitCode = 1
         finally:
             # Removing empty end state log file if exists.
             if logging.getLogger("endstateLogger").handlers:
@@ -1127,9 +1205,10 @@ class VMwareCloudDirectorNSXMigrator():
             self.utils.clearRequestsPemCert()
         except:
             pass
-        os._exit(0)
+        os._exit(130)  # PATCH-16: aborted
 
 
 if __name__ == '__main__':
     vcdMigrateObj = VMwareCloudDirectorNSXMigrator()
     vcdMigrateObj.run()
+    sys.exit(getattr(vcdMigrateObj, 'exitCode', 0))  # PATCH-16

@@ -132,15 +132,27 @@ class PasswordUtilities():
         # PATCH-7: the first line is the master key; store it DPAPI protected on Windows
         masterKey, separator, rest = data.partition('\n')
         data = protectMasterKey(masterKey) + separator + rest
-        # Write file.
-        with open(fileName, 'w') as f:
-            f.write(data)
-        # PATCH-7: on non-Windows systems at least restrict the file to the current user
-        if not _dpapiAvailable():
-            try:
-                os.chmod(fileName, 0o600)
-            except OSError:
-                pass
+        if _dpapiAvailable():
+            # Write file.
+            with open(fileName, 'w') as f:
+                f.write(data)
+            return
+        # PATCH-16: elsewhere the file is created readable by its owner only from the start (temporary file with
+        # mode 0600, then atomically replacing the target); errors are raised, not ignored
+        directory = os.path.dirname(os.path.abspath(fileName))
+        tempName = os.path.join(directory, '.{}.{}.tmp'.format(os.path.basename(fileName), secrets.token_hex(8)))
+        fd = os.open(tempName, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tempName, 0o600)
+            os.replace(tempName, fileName)
+        except Exception:
+            if os.path.exists(tempName):
+                os.remove(tempName)
+            raise
 
     def generateKey(self, masterKey):
         """
