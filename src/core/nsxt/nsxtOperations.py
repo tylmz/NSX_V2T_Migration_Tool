@@ -119,7 +119,10 @@ class NSXTOperations():
             return body
         results = list(body.get(nsxtConstants.NSX_API_RESULTS_KEY) or [])
         cursor, seen = body.get('cursor'), set()
-        while cursor and cursor not in seen:
+        while cursor:
+            if cursor in seen:
+                # PATCH-18: a cursor that comes back means the list cannot be read completely
+                raise Exception("NSX-T returned the same page cursor twice for {} - the list is incomplete".format(url))
             seen.add(cursor)
             pageUrl = '{}{}cursor={}'.format(url, '&' if '?' in url else '?', urllib.parse.quote(str(cursor), safe=''))
             page = self.restClientObj.get(url=pageUrl, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)
@@ -2011,6 +2014,10 @@ class NSXTOperations():
             response = self.restClientObj.patch(url=url, headers=nsxtConstants.NSXT_API_HEADER,
                                                 auth=self.restClientObj.auth, data=str(payloadData))
             if not response.status_code == requests.codes.ok:
+                if response.status_code == requests.codes.bad_request and field == "committed_bandwidth":
+                    # PATCH-18: an NSX-T that does not accept the current field name gets the deprecated one
+                    logger.debug("QOS profile {}: 'committed_bandwidth' rejected, using the deprecated field".format(qosProfileName))
+                    continue
                 raise Exception("Failed to create NSXT-Manager QOS profiles : {}".format(response.text[:300]))
             self.checkRealizedState(intentPath)
             readBack = self.restClientObj.get(url=url, headers=nsxtConstants.NSXT_API_HEADER, auth=self.restClientObj.auth)

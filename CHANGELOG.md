@@ -6,10 +6,35 @@ Community builds of the NSX Migration for VMware Cloud Director tool, based on u
 
 ## v1.5.9 - 2026-10-21 (pre-release)
 
+Added
+- PATCH-18: concurrent migrations of different customers. Changes to shared external networks (provider
+  gateway IP pools in topology and rollback, shared source external networks in cleanup) are made under a
+  lock shared by the tool processes on the machine and checked after each write; they are repeated when
+  another writer interfered. Optional `V2T_LOCK_DIR` sets the lock folder.
+- PATCH-18: `manual: true` for `Tier1StaticRoutes` entries the tool cannot create (for example routes via
+  the transport router). Without it such an entry fails the precheck.
+
 Changed
+- A precheck with failed validations exits 1 (PATCH-18).
+- Services fails the Tier-1 route step, after creating the other routes, when a listed route without
+  `manual: true` cannot be placed (PATCH-18).
 - NSX-V SNAT rules with an IP range as original address get the smallest network that covers the range;
   a warning is logged when it is larger than the range. Earlier builds used a larger network (up to the
   /24 of the range end), so tenants migrated with them can have broader SNAT sources (PATCH-17).
+
+Fixed
+- PATCH-18: a rejected DHCP or IPsec rollback write was treated as done, and building the payload changed
+  the stored configuration so a retry failed.
+- PATCH-18: a forward `--movecatalog` resume on a move record of the earlier format created an item list,
+  hiding the items moved before from rollback.
+- PATCH-18: catalog reads before and during moves did not renew an expired session.
+- PATCH-18: an edge gateway without Tier-0 uplink failed with an index error when no provider gateway
+  subnet had a free IP; NSX-T lists with a repeated page cursor were returned as complete; the help text
+  could be lost when output is redirected; the v2t assessment reported unreadable Org VDCs as not present.
+- PATCH-14/15: a static route whose next hop is on a routed Org VDC network was classified TIER0_UPLINK
+  when the edge attaches that network as a trunk sub-interface or reports another vNIC type; the class is
+  now decided by the edge's routed Org VDC networks as VCD reports them. Trunk vNICs and vNICs carrying a
+  routed network are never reported as interfaces added outside VCD.
 
 Fixed (PATCH-17, code paths from the upstream base)
 - v2t assessment stopped on Org VDC names that were not found and dropped Org VDCs that vanished during the

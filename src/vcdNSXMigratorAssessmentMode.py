@@ -366,7 +366,7 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
                 waitForThreadToComplete(futures)
 
             # Check if there was exception related to shared network.
-            if not reduce(lambda a, b: a + b, [errors[1] for errors in self.orgVDCerrors.values()]):
+            if not reduce(lambda a, b: a + b, [errors[1] for errors in self.orgVDCerrors.values()], []):
                 # Perform Shared Network related checks
                 self.sharedNetworkChecks()
             else:
@@ -374,7 +374,7 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
                     "Cannot perform shared network related checks, due to failures related to input file. Please fix that errors first")
 
             # Check if there was exception related to org vdc
-            if not reduce(lambda a, b: a + b, [errors[1] for errors in self.orgVDCerrors.values()]) \
+            if not reduce(lambda a, b: a + b, [errors[1] for errors in self.orgVDCerrors.values()], []) \
                     and mainConstants.BRIDGING_KEYWORD in self.executeList:
                 # Perform bridging related checks
                 self.bridgingChecks()
@@ -385,6 +385,8 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
 
             # Updating the precheck logs in log file
             self.updateInventoryLogs()
+            # PATCH-18: the outcome is returned (False when any validation failed) so the caller sets the exit code
+            return not getattr(self, 'failed', False)
         except Exception:
             raise
 
@@ -464,6 +466,7 @@ class VMwareCloudDirectorNSXMigratorAssessmentMode():
                     self.consoleLogger.error("Assessment mode for NSX-V migration to NSX-T failed")
                     self.consoleLogger.error(
                         'Check {} file for failed validations.'.format(self.preAssessmentLogs))
+                    self.failed = True  # PATCH-18: reported to the caller (exit code 1)
                 else:
                     self.consoleLogger.info(
                         f'Assessment mode for NSX-V migration to NSX-T successfully completed for org vdc/s - {", ".join([vdc["OrgVDCName"] for vdc in self.inputDict["VCloudDirector"]["SourceOrgVDC"]])}')

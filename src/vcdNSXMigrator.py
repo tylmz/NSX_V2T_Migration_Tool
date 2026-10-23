@@ -152,7 +152,7 @@ class VMwareCloudDirectorNSXMigrator():
         # the "no arguments" check, which failed on a missing --filepath)
         if not any(args.__dict__.values()):
             parser.print_help()
-            os._exit(0)
+            sys.exit(0)  # PATCH-18: a normal exit flushes the help text (os._exit dropped buffered output)
         if not args.filePath:
             parser.print_help()
             raise Exception("Invalid Input Arguments: --filepath is required")
@@ -319,6 +319,8 @@ class VMwareCloudDirectorNSXMigrator():
                     raise ValueError
                 if item.get('adminDistance') is not None and not 1 <= int(item['adminDistance']) <= 255:
                     raise ValueError
+                if 'manual' in item and not isinstance(item['manual'], bool):
+                    raise ValueError  # PATCH-18: 'manual' is true or false
             except (TypeError, ValueError):
                 errorInputDict[key] = "Invalid route {}".format(item)
                 return
@@ -868,7 +870,12 @@ class VMwareCloudDirectorNSXMigrator():
     def runPrecheck(self):
         assessmentModeObj = VMwareCloudDirectorNSXMigratorAssessmentMode \
             (self.inputDict, self.vcdObjList, self.nsxtObjList, self.nsxvObj, self.vcenterObj, self.executeList)
-        assessmentModeObj.run()
+        # PATCH-18: a failed precheck is a failed run (exit code 1), so scripts can gate the migration on it
+        passed = assessmentModeObj.run()
+        if passed is False or getattr(assessmentModeObj, 'failed', False):
+            self.exitCode = 1
+            return False
+        return True
 
     def runPreparation(self):
         # Warning table for workflows that will be skipped
@@ -1123,7 +1130,8 @@ class VMwareCloudDirectorNSXMigrator():
 
             # Running migration script in assessment Mode
             if self.assessmentMode:
-                self.runPrecheck()
+                if self.runPrecheck() is False:  # PATCH-18
+                    self.exitCode = 1
                 return
 
             self.runPreparation()
@@ -1172,21 +1180,33 @@ class VMwareCloudDirectorNSXMigrator():
                                         "main log file {}".format(self.mainLogfile))
             self.exitCode = 1
         finally:
-            # Removing empty end state log file if exists.
-            if logging.getLogger("endstateLogger").handlers:
-                filePath = logging.getLogger("endstateLogger").handlers[0].baseFilename
-                logging.getLogger("endstateLogger").handlers[0].close()
-                if os.stat(filePath).st_size == 0:
-                    os.remove(filePath)
+            # PATCH-18: each closing step runs on its own; a failure is logged and makes a successful run exit 1, but
+            # never replaces an earlier failure or abort result
+            def closingStep(step):
+                try:
+                    step()
+                except Exception as closingError:
+                    logging.debug(traceback.format_exc())
+                    self.consoleLogger.error('Closing step failed: {}'.format(closingError))
+                    if self.exitCode == 0:
+                        self.exitCode = 1
+
+            def removeEmptyEndStateLog():
+                # Removing empty end state log file if exists.
+                if logging.getLogger("endstateLogger").handlers:
+                    filePath = logging.getLogger("endstateLogger").handlers[0].baseFilename
+                    logging.getLogger("endstateLogger").handlers[0].close()
+                    if os.stat(filePath).st_size == 0:
+                        os.remove(filePath)
+            closingStep(removeEmptyEndStateLog)
             # logging out vcd user
-            if getattr(self, 'vcdObjList', None):
-                for vcdObject in self.vcdObjList:
-                    vcdObject.deleteSession()
+            for vcdObject in getattr(self, 'vcdObjList', None) or []:
+                closingStep(vcdObject.deleteSession)
             # logging out the vcenter user
             if getattr(self, 'vcenterObj', None) and self.vcenterObj and self.vcenterObj.VCENTER_SESSION_CREATED:
-                self.vcenterObj.deleteSession()
+                closingStep(self.vcenterObj.deleteSession)
             # clear the requests certificates entries
-            self.utils.clearRequestsPemCert()
+            closingStep(self.utils.clearRequestsPemCert)
 
     def signalHandler(self, sig, frame):
         """

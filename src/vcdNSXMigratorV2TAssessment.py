@@ -584,10 +584,13 @@ class VMwareCloudDirectorNSXMigratorV2T:
                             raise Exception(f"Organization '{org}' not found")
                         orgUrl = self.vcdValidationObj.getOrgUrl(org)
                         self.vcdValidationObj.getOrgVDCUrl(orgUrl, VDC, saveResponse=True)
-                    except:
-                        orgVDCResult['Status'] = STATUS_CODES[40] if orgError else STATUS_CODES[50]
+                    except Exception as err:
+                        # PATCH-18: only a confirmed absence is 'not present'; any other failure is 'not accessible'
+                        absent = not orgError and (org == 'NA' or type(err).__name__ == 'VDCNotFoundError')
+                        reason = orgError or ("not present" if absent else str(err))
+                        orgVDCResult['Status'] = STATUS_CODES[50] if absent else STATUS_CODES[40]
                         self.consoleLogger.warning(f"Org VDC '{VDC}' of organization '{org}' not evaluated - " +
-                                                   (f"organization could not be read: {orgError}" if orgError else "not present"))
+                                                   ("not present" if absent else f"could not be read: {reason}"))
                         self.changeLoggingFormat(f"{VDC}:{org}", restore=True)
                         self.reportData.append(orgVDCResult)
                         continue

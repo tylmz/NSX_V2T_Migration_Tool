@@ -1825,9 +1825,13 @@ class VCDMigrationValidation:
 
     @staticmethod
     def vnicAddressGroups(vnic):
-        """PATCH-14: address groups of an NSX-V vNIC as [{'network', 'primary', 'secondary'}]."""
+        """PATCH-14: address groups of an NSX-V vNIC as [{'network', 'primary', 'secondary'}], including those of the
+        sub-interfaces of a trunk vNIC."""
         result = []
-        for group in listify((vnic.get('addressGroups') or {}).get('addressGroup')):
+        groups = listify((vnic.get('addressGroups') or {}).get('addressGroup'))
+        for subInterface in listify((vnic.get('subInterfaces') or {}).get('subInterface')):
+            groups += listify(((subInterface or {}).get('addressGroups') or {}).get('addressGroup'))
+        for group in groups:
             group = group or {}
             primary = group.get('primaryAddress')
             prefix = group.get('subnetPrefixLength') or group.get('subnetMask')
@@ -1851,6 +1855,32 @@ class VCDMigrationValidation:
     @staticmethod
     def _routeKey(network, nextHop):
         return str(ipaddress.ip_network(str(network).strip(), strict=False)), str(ipaddress.ip_address(str(nextHop).strip()))
+
+    def tier1RouteEntry(self, edgeGatewayName, network, nextHop):
+        """PATCH-18: the 'Tier1StaticRoutes' entry of an edge for a route, None when not listed."""
+        key = self._routeKey(network, nextHop)
+        for entry in self.tier1RoutesInput(edgeGatewayName) or []:
+            try:
+                if self._routeKey(entry['network'], entry['nextHop']) == key:
+                    return entry
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
+
+    def routeCreatableOnTier1(self, edgeGatewayName, route):
+        """PATCH-18: whether the tool can create an ESG route on the Tier-1: its next hop is on a routed Org VDC network
+        or segment backed uplink, or on an interface added outside VCD that ServiceUplinks migrates."""
+        if route['class'] in ('INTERNAL', 'SERVICE_UPLINK'):
+            return True
+        if route['class'] == 'UNMANAGED_UPLINK':
+            config = self._serviceUplinkConfig(edgeGatewayName)
+            if not config:
+                return False
+            uplinks = config.get('Uplinks', 'auto')
+            if uplinks in ('auto', None):
+                return True
+            return route.get('interface') in {spec.get('portgroup') for spec in listify(uplinks) if isinstance(spec, dict)}
+        return False
 
     def compareTier1StaticRoutes(self, edgeGatewayName, recordedRoutes):
         """
@@ -1903,6 +1933,23 @@ class VCDMigrationValidation:
                 return plan
         return None
 
+    def edgeRoutedNetworkSubnets(self, edgeGatewayName):
+        """PATCH-14: [(ip_network, network name)] of the routed Org VDC networks connected to a source edge gateway,
+        as VCD reports them (independent of how the edge attaches them: internal vNIC or trunk sub-interface)."""
+        subnets = []
+        networks = self.getOrgVDCNetworks(self.rollback.apiData['sourceOrgVDC']['@id'], 'sourceOrgVDCNetworks',
+                                          saveResponse=False)
+        for network in networks or []:
+            if ((network.get('connection') or {}).get('routerRef') or {}).get('name') != edgeGatewayName:
+                continue
+            for subnet in (network.get('subnets') or {}).get('values') or []:
+                try:
+                    subnets.append((ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']),
+                                                         strict=False), network['name']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return subnets
+
     def recordEsgStaticRoutes(self, edgeGatewayId, edgeGatewayName, staticRoutes):
         """
         PATCH-14 part 1: classifies and records the static routes of an NSX-V edge, logs each one.
@@ -1929,6 +1976,7 @@ class VCDMigrationValidation:
         blocks = self.dmzBlocks()
         networks = [str(route.get('network')) for route in staticRoutes]
         segmentUplinks = (data.get('isT1Connected') or {}).get(edgeGatewayName, {})
+        routedSubnets = self.edgeRoutedNetworkSubnets(edgeGatewayName)
         result = []
         for route in staticRoutes:
             network, nextHop = str(route.get('network')), str(route.get('nextHop'))
@@ -1944,10 +1992,21 @@ class VCDMigrationValidation:
                     except ValueError:
                         break
             portgroupName = (vnic or {}).get('portgroupName') or ''
-            if vnic is None:
-                routeClass = 'UNRESOLVED'
-            elif 'DLR_to_EDGE' in portgroupName:
+            try:
+                nextHopIp = ipaddress.ip_address(nextHop)
+            except ValueError:
+                nextHopIp = None
+            routedNetwork = next((name for subnet, name in routedSubnets
+                                  if nextHopIp is not None and nextHopIp.version == subnet.version and nextHopIp in subnet), None)
+            if 'DLR_to_EDGE' in portgroupName:
                 routeClass = 'AUTO'
+            elif routedNetwork:
+                # the next hop is in a routed Org VDC network of this edge: that network moves to the Tier-1,
+                # whatever vNIC type the edge uses for it (internal vNIC or trunk sub-interface)
+                routeClass = 'INTERNAL'
+                portgroupName = portgroupName or routedNetwork
+            elif vnic is None:
+                routeClass = 'UNRESOLVED'
             elif str(vnic.get('index')) in unmanagedIndexes:
                 routeClass = 'UNMANAGED_UPLINK'
             elif vnic.get('type') == 'internal':
@@ -2043,9 +2102,13 @@ class VCDMigrationValidation:
                     if backing.get('backingId'):
                         knownMorefs.add(backing['backingId'])
         dummyName = (data.get('dummyExternalNetwork') or {}).get('name')
+        routedSubnets = [subnet for subnet, _ in self.edgeRoutedNetworkSubnets(edgeGatewayName)]
         found = []
         for vnic in vnics:
             if str(vnic.get('isConnected')).lower() != 'true':
+                continue
+            # trunk vNICs carry VCD's routed Org VDC networks as sub-interfaces: never an interface added outside VCD
+            if str(vnic.get('type')).lower() == 'trunk':
                 continue
             portgroupId = vnic.get('portgroupId') or ''
             portgroupName = vnic.get('portgroupName') or ''
@@ -2056,6 +2119,9 @@ class VCDMigrationValidation:
             groups = self.vnicAddressGroups(vnic)
             if not groups:
                 continue
+            if any(group['network'].overlaps(subnet) for group in groups for subnet in routedSubnets
+                   if group['network'].version == subnet.version):
+                continue  # carries a routed Org VDC network of this edge
             found.append({'index': str(vnic.get('index')), 'name': vnic.get('name'), 'type': vnic.get('type'),
                           'portgroupId': portgroupId, 'portgroupName': portgroupName, 'mtu': vnic.get('mtu'),
                           'subnets': [{'network': str(group['network']), 'primary': group['primary'],
@@ -5210,12 +5276,23 @@ class VCDMigrationValidation:
                         errorList.append("Source OrgVDC EdgeGateway {}: 'Tier1StaticRoutes' does not match the static "
                                          "routes of the NSX-V edge: {}\n".format(edgeGatewayName, '; '.join(mismatches)))
                     else:
+                        # PATCH-18: a listed route the tool cannot create on the Tier-1 must be marked 'manual: true'
+                        notCreatable = []
                         for route in recordedRoutes:
-                            if route['class'] not in ('INTERNAL', 'SERVICE_UPLINK', 'UNMANAGED_UPLINK', 'AUTO'):
-                                logger.warning("Source OrgVDC EdgeGateway {}: static route {} via {} [{}] is listed but "
-                                               "cannot be created on the Tier-1 - configure it manually if it is still "
-                                               "needed".format(edgeGatewayName, route['network'], route['nextHop'],
-                                                               route['class']))
+                            if route['class'] == 'AUTO':
+                                continue
+                            entry = self.tier1RouteEntry(edgeGatewayName, route['network'], route['nextHop']) or {}
+                            if entry.get('manual') is True:
+                                logger.warning("Source OrgVDC EdgeGateway {}: static route {} via {} [{}] is marked "
+                                               "'manual: true' - it is not created by the tool".format(
+                                                   edgeGatewayName, route['network'], route['nextHop'], route['class']))
+                            elif not self.routeCreatableOnTier1(edgeGatewayName, route):
+                                notCreatable.append('{} via {} [{}]'.format(route['network'], route['nextHop'], route['class']))
+                        if notCreatable:
+                            errorList.append("Source OrgVDC EdgeGateway {}: static route(s) {} cannot be created on the "
+                                             "Tier-1 (next hop not on a network the Tier-1 gets). Add 'manual: true' to the "
+                                             "entry if you handle the route yourself or it is not needed after the "
+                                             "migration\n".format(edgeGatewayName, '; '.join(notCreatable)))
                 # checking if routing is enabled, if so raising exception
                 if responseDict['routing']['ospf']['enabled'] == "true":
                     errorList.append("OSPF routing protocol is configured in the Source but not supported in the "

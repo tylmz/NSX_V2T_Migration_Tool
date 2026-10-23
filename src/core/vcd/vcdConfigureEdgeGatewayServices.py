@@ -3012,10 +3012,12 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                                       vcdConstants.EDGE_GATEWAY_DHCP_CONFIG_BY_ID .format(edgeGatewayId))
                 # if DHCP pool was present in the source
                 if data[sourceEdgeGatewayId]['ipPools'] or data[sourceEdgeGatewayId].get('staticBindings') or data[sourceEdgeGatewayId].get('relay'):
-                    del data[sourceEdgeGatewayId]['version']
-                    if data[sourceEdgeGatewayId].get('relay'):
+                    # PATCH-18: the payload is built from a copy; the stored configuration stays intact for a retry
+                    DHCPPayload = copy.deepcopy(data[sourceEdgeGatewayId])
+                    DHCPPayload.pop('version', None)
+                    if DHCPPayload.get('relay'):
                         # get relay agents list from DHCP configuration.
-                        DHCPData = data[sourceEdgeGatewayId]
+                        DHCPData = DHCPPayload
                         relayAgentsData = DHCPData['relay']['relayAgents']['relayAgents']
                         if isinstance(relayAgentsData, list):
                             relayAgentsList = [relayAgent['giAddress'] for relayAgent in relayAgentsData]
@@ -3029,16 +3031,19 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                                 for relayAgent in relayAgentsData:
                                     if relayAgent['giAddress'] == networkGateway:
                                         relayAgent['vnicIndex'] = orgvdcNetworkVNics
-                        data[sourceEdgeGatewayId]['relay']['relayAgents']['relayAgents'] = relayAgentsData
-                    payloadData = json.dumps(data[sourceEdgeGatewayId])
+                        DHCPPayload['relay']['relayAgents']['relayAgents'] = relayAgentsData
+                    payloadData = json.dumps(DHCPPayload)
                     self.headers['Content-Type'] = vcdConstants.OPEN_API_CONTENT_TYPE
                     response = self.restClientObj.put(url, self.headers, data=payloadData)
-                    if response.status_code == requests.codes.accepted:
-                        # only need job ID from Location so splitting it
-                        jobId = response.headers['Location'].split('/')[-1]
-                        taskUrl = '{}{}{}'.format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress), vcdConstants.NETWORK_EDGES, vcdConstants.NSX_JOBS.format(jobId))
-                        # PATCH-16: bounded wait for the NSX-V edge job (deadline, polling interval, failure reported)
-                        self._waitForEdgeJob(taskUrl, 'DHCP rollback')
+                    # PATCH-18: a rejected write fails the rollback step (it stays in the remaining rollback tasks)
+                    if response.status_code != requests.codes.accepted:
+                        raise Exception("DHCP rollback of edge gateway {} rejected (HTTP {}): {}".format(
+                            edgeGatewayId, response.status_code, response.text[:300]))
+                    # only need job ID from Location so splitting it
+                    jobId = response.headers['Location'].split('/')[-1]
+                    taskUrl = '{}{}{}'.format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress), vcdConstants.NETWORK_EDGES, vcdConstants.NSX_JOBS.format(jobId))
+                    # PATCH-16: bounded wait for the NSX-V edge job (deadline, polling interval, failure reported)
+                    self._waitForEdgeJob(taskUrl, 'DHCP rollback')
         except Exception:
             raise
 
@@ -3061,21 +3066,25 @@ class ConfigureEdgeGatewayServices(VCDMigrationValidation):
                                                  vcdConstants.NETWORK_EDGES,
                                                  vcdConstants.EDGE_GATEWAY_IPSEC_CONFIG.format(edgeGatewayId))
                 if data['sites']:
-                    del data['version']
-                    for site in data['sites']['sites']:
-                        del site['siteId']
-                        if site.get('ConfigStatus'):
-                            del site['ConfigStatus']
-                    payloadData = json.dumps(data)
+                    # PATCH-18: the payload is built from a copy; the stored configuration stays intact for a retry
+                    payload = copy.deepcopy(data)
+                    payload.pop('version', None)
+                    for site in listify(payload['sites']['sites']):
+                        site.pop('siteId', None)
+                        site.pop('ConfigStatus', None)
+                    payloadData = json.dumps(payload)
                     self.headers['Content-Type'] = vcdConstants.OPEN_API_CONTENT_TYPE
                     response = self.restClientObj.put(url, self.headers, data=payloadData)
-                    if response.status_code == requests.codes.accepted:
-                        # only need job ID from Location so spliting it
-                        jobId = response.headers['Location'].split('/')[-1]
-                        taskUrl = '{}{}{}'.format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress),
-                                                  vcdConstants.NETWORK_EDGES, vcdConstants.NSX_JOBS.format(jobId))
-                        # PATCH-16: bounded wait for the NSX-V edge job (deadline, polling interval, failure reported)
-                        self._waitForEdgeJob(taskUrl, 'IPsec rollback')
+                    # PATCH-18: a rejected write fails the rollback step (it stays in the remaining rollback tasks)
+                    if response.status_code != requests.codes.accepted:
+                        raise Exception("IPsec rollback of edge gateway {} rejected (HTTP {}): {}".format(
+                            edgeGatewayId, response.status_code, response.text[:300]))
+                    # only need job ID from Location so spliting it
+                    jobId = response.headers['Location'].split('/')[-1]
+                    taskUrl = '{}{}{}'.format(vcdConstants.XML_VCD_NSX_API.format(self.ipAddress),
+                                              vcdConstants.NETWORK_EDGES, vcdConstants.NSX_JOBS.format(jobId))
+                    # PATCH-16: bounded wait for the NSX-V edge job (deadline, polling interval, failure reported)
+                    self._waitForEdgeJob(taskUrl, 'IPsec rollback')
         except Exception:
             raise
 

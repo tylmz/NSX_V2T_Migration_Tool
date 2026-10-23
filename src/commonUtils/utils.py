@@ -7,6 +7,9 @@ Description: Module which contains all the utilities required for VMware Cloud D
 """
 
 import ast  # PATCH-16
+import contextlib  # PATCH-18
+import tempfile  # PATCH-18
+import time  # PATCH-18
 import json
 import logging
 import os
@@ -53,6 +56,65 @@ def safeLiteral(text):
         raise ValueError('unsupported expression {}'.format(type(node).__name__))
 
     return convert(ast.parse(str(text).strip(), mode='eval').body)
+
+
+def sharedLockDirectory():
+    """PATCH-18: folder for locks shared by every tool process on this machine (all users): V2T_LOCK_DIR when set,
+    else ProgramData on Windows, else the system temp folder."""
+    base = os.environ.get('V2T_LOCK_DIR') or (os.path.join(os.environ.get('PROGRAMDATA', tempfile.gettempdir()),
+                                                           'vcdNSXMigrator', 'locks') if os.name == 'nt' else
+                                              os.path.join(tempfile.gettempdir(), 'vcdNSXMigrator-locks'))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+@contextlib.contextmanager
+def sharedObjectLock(name, timeout=600):
+    """
+    PATCH-18: exclusive lock across the tool processes on this machine (concurrent migrations of other customers),
+    held for a read-change-write of an object they share, such as a provider gateway's IP pools.
+    """
+    path = os.path.join(sharedLockDirectory(), re.sub(r'[^A-Za-z0-9_.-]', '_', str(name))[:150] + '.lock')
+    try:
+        handle = open(path, 'a+')
+    except PermissionError:
+        # created by another account: locking needs only a read handle
+        try:
+            handle = open(path, 'r')
+        except OSError as err:
+            raise Exception("Cannot open the shared lock file {} ({}) - set V2T_LOCK_DIR to a folder every operator "
+                            "account can write".format(path, err))
+    deadline = time.monotonic() + timeout
+    locked = False
+    try:
+        while not locked:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Exception("Timed out after {} seconds waiting for the shared lock '{}' ({})".format(timeout, name, path))
+                time.sleep(0.5)
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def listify(_list):

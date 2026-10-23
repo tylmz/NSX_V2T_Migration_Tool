@@ -11,6 +11,7 @@ import ipaddress
 import logging
 import json
 import re
+import random  # PATCH-18
 import time
 import os
 import copy
@@ -25,7 +26,7 @@ from itertools import zip_longest
 from functools import reduce
 import src.core.vcd.vcdConstants as vcdConstants
 import src.core.nsxt.nsxtConstants as nsxtConstants
-from src.commonUtils.utils import listify, urn_id
+from src.commonUtils.utils import sharedObjectLock, listify, urn_id
 from src.core.vcd.vcdValidations import (
     isSessionExpired, description, remediate, remediate_threaded, getSession)
 from src.core.vcd.vcdConfigureEdgeGatewayServices import ConfigureEdgeGatewayServices
@@ -300,6 +301,10 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             network, nextHop = self._routeKey(item['network'], item['nextHop'])
             esgRoute = recorded.get((network, nextHop)) or {}
             distance = item.get('adminDistance') if item.get('adminDistance') is not None else esgRoute.get('adminDistance')
+            if item.get('manual') is True:
+                logger.info("PATCH-18: edge gateway {}: route {} via {} is marked 'manual: true' - not created".format(
+                    edgeGatewayName, network, nextHop))
+                continue
             wanted.append({'network': network, 'nextHop': nextHop, 'adminDistance': int(distance or 1),
                            'description': item.get('description') or esgRoute.get('description') or 'Tier1StaticRoutes'})
         return wanted
@@ -331,6 +336,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         targetNetworks = self.getOrgVDCNetworks(data['targetOrgVDC']['@id'], 'targetOrgVDCNetworks', saveResponse=False)
         recorded = data.get('tier1StaticRoutes') or []
         headers = self._cloudApiHeaders()
+        unplaced = []
         for targetEdgeGateway in edges:
             edgeName, edgeId = targetEdgeGateway['name'], targetEdgeGateway['id']
             wanted = self._wantedTier1Routes(edgeName)
@@ -339,8 +345,11 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 nextHop = ipaddress.ip_address(route['nextHop'])
                 scope = next((item[1] for item in scopes if nextHop.version == item[0].version and nextHop in item[0]), None)
                 if not scope:
-                    logger.warning("PATCH-14: edge gateway {}: route {} via {} not created - the next hop is in no network "
-                                   "of the Tier-1".format(edgeName, route['network'], route['nextHop']))
+                    # PATCH-18: every listed route without 'manual: true' must be created; the others are still created
+                    # and the step then fails, listing the routes that could not be placed
+                    logger.error("PATCH-14: edge gateway {}: route {} via {} not created - the next hop is in no network "
+                                 "of the Tier-1".format(edgeName, route['network'], route['nextHop']))
+                    unplaced.append('{}: {} via {}'.format(edgeName, route['network'], route['nextHop']))
                     continue
                 hop = {'ipAddress': route['nextHop'], 'adminDistance': route['adminDistance'],
                        'scope': {'name': scope['name'], 'id': scope['id'], 'scopeType': 'NETWORK'}}
@@ -388,6 +397,9 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 self._recordTier1Route(recorded, entry)
                 logger.info("PATCH-14: edge gateway {}: Tier-1 route {} -> {} (scope {}, distance {}) {}".format(
                     edgeName, route['network'], route['nextHop'], scope['name'], route['adminDistance'], entry['mode']))
+        if unplaced:
+            raise Exception("PATCH-18: static route(s) without 'manual: true' could not be created on the Tier-1: {}. Fix the "
+                            "cause or mark them 'manual: true', then run the step again".format('; '.join(unplaced)))
 
     @isSessionExpired
     def removeTier1StaticRoutes(self):
@@ -916,6 +928,61 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
 
         return edgeGatewaySubnetDict
 
+    @staticmethod
+    def _subnetPoolIps(subnet):
+        """PATCH-18: IPs (as integers) of a subnet's static pool."""
+        ips = set()
+        for ipRange in ((subnet.get('ipRanges') or {}).get('values')) or []:
+            ips.update(range(int(ipaddress.ip_address(ipRange['startAddress'])), int(ipaddress.ip_address(ipRange['endAddress'])) + 1))
+        return ips
+
+    def _poolsSatisfy(self, externalNetwork, wantPresent, wantAbsent):
+        """PATCH-18: True when every (subnet, ip) of wantPresent is in the pools and none of wantAbsent is."""
+        pools = {}
+        for subnet in (externalNetwork.get('subnets') or {}).get('values') or []:
+            key = str(ipaddress.ip_network('{}/{}'.format(subnet['gateway'], subnet['prefixLength']), strict=False))
+            pools.setdefault(key, set()).update(self._subnetPoolIps(subnet))
+        return all(ip in pools.get(key, set()) for key, ip in wantPresent) and \
+            not any(ip in pools.get(key, set()) for key, ip in wantAbsent)
+
+    def _updateExternalNetworkPools(self, networkName, change, what, attempts=3):
+        """
+        PATCH-18: read-change-write of an external network that concurrent migrations (other tool processes) may change
+        at the same time, such as a shared provider gateway. Under a lock shared by the tool processes on this machine,
+        the network is read fresh, changed by change(payload) - which returns the (subnet, ip) pairs that must be in
+        the pools afterwards and those that must not - written, and read back. If the result does not hold (another
+        writer outside the lock), the whole step is repeated. Returns the written network.
+        """
+        for attempt in range(1, attempts + 1):
+            with sharedObjectLock('external-network-{}'.format(networkName)):
+                current = self.getExternalNetworkByName(networkName)
+                payload = copy.deepcopy(current)
+                wantPresent, wantAbsent = change(payload)
+                if self._poolsSatisfy(current, wantPresent, wantAbsent):
+                    logger.debug("External network {} already has the wanted {}".format(networkName, what))
+                    return current
+                url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress), vcdConstants.ALL_EXTERNAL_NETWORKS,
+                                       payload['id'])
+                self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
+                response = self.restClientObj.put(url, self.headers, data=json.dumps(payload))
+                if response.status_code != requests.codes.accepted:
+                    try:
+                        message = response.json().get('message')
+                    except (ValueError, AttributeError):
+                        message = response.text[:300]
+                    if "provided list 'ipRanges.values' should have at least one" in str(message):
+                        message = "{} Add one extra IP address to static pool of external network - {}".format(message, networkName)
+                    raise Exception("Failed to update External network {} with {} - {}".format(networkName, what, message))
+                self._checkTaskStatus(taskUrl=response.headers['Location'])
+                if self._poolsSatisfy(self.getExternalNetworkByName(networkName), wantPresent, wantAbsent):
+                    logger.debug("External network {} updated with {}".format(networkName, what))
+                    return payload
+            logger.warning("External network {} was changed by another writer while updating {} - retrying ({}/{})".format(
+                networkName, what, attempt, attempts))
+            time.sleep(random.uniform(2, 6))
+        raise Exception("External network {} could not be updated with {} consistently after {} attempts".format(
+            networkName, what, attempts))
+
     def _updateTargetExternalNetworkPool(self):
         # Acquiring lock as only one operation can be performed on an external network at a time
         with self.lock:  # PATCH-16: released on every exit path (returns and exceptions)
@@ -951,42 +1018,28 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                             raise Exception("Provider Gateway IP Space uplink - '{}' with sub allocated ip pools - {}".format(
                                 ipSpace['name'], errorResponse['message']))
                 else:
-                    for targetExtNetSubnet in targetExtNetData['subnets']['values']:
-                        targetExtNetSubnetAddress = ipaddress.ip_network(
-                            '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
-                        # PATCH-1: tolerate a null pool; PATCH-1b: never add an IP that is already in the target pool
-                        if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):
-                            targetExtNetSubnet['ipRanges'] = {}
-                        existingRanges = targetExtNetSubnet['ipRanges'].get('values') or []
-                        existingIps = set()
-                        for existingRange in existingRanges:
-                            existingIps.update(range(int(ipaddress.ip_address(existingRange['startAddress'])),
-                                                     int(ipaddress.ip_address(existingRange['endAddress'])) + 1))
-                        for newRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
-                            for ipInt in range(int(ipaddress.ip_address(newRange['startAddress'])),
-                                               int(ipaddress.ip_address(newRange['endAddress'])) + 1):
-                                if ipInt not in existingIps:
-                                    ipStr = str(ipaddress.ip_address(ipInt))
-                                    existingRanges.append({'startAddress': ipStr, 'endAddress': ipStr})
-                                    existingIps.add(ipInt)
-                                else:
-                                    logger.debug("PATCH-1b: IP {} already in target external network pool, not added again".format(
-                                        ipaddress.ip_address(ipInt)))
-                        targetExtNetSubnet['ipRanges']['values'] = existingRanges
-
-                    url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
-                                           vcdConstants.ALL_EXTERNAL_NETWORKS, targetExtNetData['id'])
-                    self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
-                    response = self.restClientObj.put(url, self.headers, data=json.dumps(targetExtNetData))
-                    if response.status_code == requests.codes.accepted:
-                        taskUrl = response.headers['Location']
-                        self._checkTaskStatus(taskUrl=taskUrl)
-                        logger.debug('Target External network {} updated successfully with sub allocated ip pools.'.format(
-                            targetExtNetData['name']))
-                    else:
-                        errorResponse = response.json()
-                        raise Exception('Failed to update External network {} with sub allocated ip pools - {}'.format(
-                            targetExtNetData['name'], errorResponse['message']))
+                    # PATCH-18: locked, verified read-change-write (other migrations may update the same network)
+                    def addPools(payload, sourceEgwSubnets=sourceEgwSubnets):
+                        wantPresent = set()
+                        for targetExtNetSubnet in payload['subnets']['values']:
+                            targetExtNetSubnetAddress = ipaddress.ip_network(
+                                '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
+                            # PATCH-1: tolerate a null pool; PATCH-1b: never add an IP that is already in the target pool
+                            if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):
+                                targetExtNetSubnet['ipRanges'] = {}
+                            existingRanges = targetExtNetSubnet['ipRanges'].get('values') or []
+                            existingIps = self._subnetPoolIps(targetExtNetSubnet)
+                            for newRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
+                                for ipInt in range(int(ipaddress.ip_address(newRange['startAddress'])),
+                                                   int(ipaddress.ip_address(newRange['endAddress'])) + 1):
+                                    wantPresent.add((str(targetExtNetSubnetAddress), ipInt))
+                                    if ipInt not in existingIps:
+                                        ipStr = str(ipaddress.ip_address(ipInt))
+                                        existingRanges.append({'startAddress': ipStr, 'endAddress': ipStr})
+                                        existingIps.add(ipInt)
+                            targetExtNetSubnet['ipRanges']['values'] = existingRanges
+                        return wantPresent, set()
+                    self._updateExternalNetworkPools(targetExtNetName, addPools, 'sub allocated ip pools')
 
             # Releasing lock
 
@@ -1109,9 +1162,14 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                 elif sourceEdgeGatewayDict['name'] not in data['isT0Connected']:
                     # In case target edge gateway is not going to be connected to T0, a dummy T0/VRF is necessary
                     # Adding first subnet from dummy T0 because payload demands atleast one subnet
-                    subnetData = [subnet for subnet in externalDict['subnets']['values'] if
-                                  subnet['totalIpCount'] != subnet['usedIpCount']]
-                    subnetData = [subnetData[0]]
+                    freeSubnets = [subnet for subnet in externalDict['subnets']['values'] if
+                                   subnet['totalIpCount'] != subnet['usedIpCount']]
+                    if not freeSubnets:
+                        # PATCH-18: a clear error instead of an index error; no IP is taken from the subnet
+                        raise Exception("Edge gateway {} has no uplink on provider gateway {}; VCD still needs one of its "
+                                        "subnets with a free IP to create the edge gateway (no IP is allocated) - add a free "
+                                        "IP to one of its static pools".format(sourceEdgeGatewayDict['name'], externalDict['name']))
+                    subnetData = [copy.deepcopy(freeSubnets[0])]
                     subnetData[0]['ipRanges'] = {'values': []}
                     subnetData[0]['primaryIp'] = None
 
@@ -5518,70 +5576,61 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             networkMetadata = copy.deepcopy(networkData)
             for network in networkData:
                 networkName = network['name']
-                response = self.getExternalNetworkByName(networkName)
-                # getting the external network sub allocated pools
-                for index, subnet in enumerate(response['subnets']['values']):
-                    externalRanges = (subnet.get('ipRanges') or {}).get('values') or []  # PATCH-1
-                    externalRangeList = []
-                    externalNetworkSubnet = ipaddress.ip_network(
-                        '{}/{}'.format(subnet['gateway'], subnet['prefixLength']),
-                        strict=False)
-                    # creating range of source external network pool range
-                    for externalRange in externalRanges:
-                        externalRangeList.extend(
-                            self.createIpRange(externalNetworkSubnet, externalRange['startAddress'], externalRange['endAddress']))
-                    subIpPools = edgeGatewaySubnetDict.get(externalNetworkSubnet)
-                    # If no ipPools are used from corresponding network then skip the iteration
-                    if not subIpPools:
-                        continue
-                    # Raise exception if target ext network subnet has only one IP and EmptyPoolOverride flag is False
-                    if subnet["totalIpCount"] == len(set(tuple(d.items()) for d in edgeGatewaySubnetDict[externalNetworkSubnet])):
-                        if self.orgVdcInput.get("EmptyIPPoolOverride", False):
-                            logger.warning("Skipping removing '{}' IP from source external network - '{}'".format(
-                                externalRanges[0]["startAddress"] if externalRanges else 'N/A', networkName))  # PATCH-1
+
+                # PATCH-18: locked, verified read-change-write (other migrations share these external networks)
+                def removeSourcePools(response, networkName=networkName):
+                    wantAbsent = set()
+                    # getting the external network sub allocated pools
+                    for index, subnet in enumerate(response['subnets']['values']):
+                        externalRanges = (subnet.get('ipRanges') or {}).get('values') or []  # PATCH-1
+                        externalRangeList = []
+                        externalNetworkSubnet = ipaddress.ip_network(
+                            '{}/{}'.format(subnet['gateway'], subnet['prefixLength']),
+                            strict=False)
+                        # creating range of source external network pool range
+                        for externalRange in externalRanges:
+                            externalRangeList.extend(
+                                self.createIpRange(externalNetworkSubnet, externalRange['startAddress'], externalRange['endAddress']))
+                        subIpPools = edgeGatewaySubnetDict.get(externalNetworkSubnet)
+                        # If no ipPools are used from corresponding network then skip the iteration
+                        if not subIpPools:
                             continue
-                        else:
-                            raise Exception("External Network subnet should have atleast one free IP address which cannot be removed."
-                                            " EmptyPoolOverride flag must be set to true to perform successfull rollback/cleanup")
-
-                    # creating range of source edge gateway sub allocated pool range
-                    subIpRangeList = []
-                    for ipRange in subIpPools:
-                        subIpRangeList.extend(
-                            self.createIpRange(externalNetworkSubnet, ipRange['startAddress'], ipRange['endAddress']))
-                    # removing the sub allocated ip pools of source edge gateway from source external network
-                    for ip in subIpRangeList:
-                        if ip in externalRangeList:
-                            if len(externalRangeList) == 1 and self.orgVdcInput.get("EmptyIPPoolOverride", False):
-                                logger.warning("Skipping removing the sub allocated '{}' IP of source edge gateway from source external network - '{}'".format(
-                                    externalRangeList[0], networkName))
-                                break
+                        # Raise exception if target ext network subnet has only one IP and EmptyPoolOverride flag is False
+                        if subnet["totalIpCount"] == len(set(tuple(d.items()) for d in edgeGatewaySubnetDict[externalNetworkSubnet])):
+                            if self.orgVdcInput.get("EmptyIPPoolOverride", False):
+                                logger.warning("Skipping removing '{}' IP from source external network - '{}'".format(
+                                    externalRanges[0]["startAddress"] if externalRanges else 'N/A', networkName))  # PATCH-1
+                                continue
                             else:
-                                externalRangeList.remove(ip)
-                    # getting the source edge gateway sub allocated ip pool after removing used ips i.e source edge gateway
-                    result = self.createExternalNetworkSubPoolRangePayload(externalRangeList)
-                    response['subnets']['values'][index]['ipRanges']['values'] = result
+                                raise Exception("External Network subnet should have atleast one free IP address which cannot be removed."
+                                                " EmptyPoolOverride flag must be set to true to perform successfull rollback/cleanup")
+                        # creating range of source edge gateway sub allocated pool range
+                        subIpRangeList = []
+                        for ipRange in subIpPools:
+                            subIpRangeList.extend(
+                                self.createIpRange(externalNetworkSubnet, ipRange['startAddress'], ipRange['endAddress']))
+                        # removing the sub allocated ip pools of source edge gateway from source external network
+                        for ip in subIpRangeList:
+                            if ip in externalRangeList:
+                                if len(externalRangeList) == 1 and self.orgVdcInput.get("EmptyIPPoolOverride", False):
+                                    logger.warning("Skipping removing the sub allocated '{}' IP of source edge gateway from source external network - '{}'".format(
+                                        externalRangeList[0], networkName))
+                                    break
+                                else:
+                                    externalRangeList.remove(ip)
+                                    wantAbsent.add((str(externalNetworkSubnet), int(ipaddress.ip_address(ip))))
+                        # getting the source edge gateway sub allocated ip pool after removing used ips i.e source edge gateway
+                        result = self.createExternalNetworkSubPoolRangePayload(externalRangeList)
+                        if not isinstance(response['subnets']['values'][index].get('ipRanges'), dict):
+                            response['subnets']['values'][index]['ipRanges'] = {}
+                        response['subnets']['values'][index]['ipRanges']['values'] = result
+                    return set(), wantAbsent
 
-                # API call to update external network details
-                payloadData = json.dumps(response)
-                # TODO pranshu: multiple T0 - cleanup - update source network pool
-                url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
-                                       vcdConstants.ALL_EXTERNAL_NETWORKS, response['id'])
-                # put api call to update the external networks ip allocation
-                self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
-                apiResponse = self.restClientObj.put(url, self.headers, data=payloadData)
-                if apiResponse.status_code == requests.codes.accepted:
-                    taskUrl = apiResponse.headers['Location']
-                    # checking the status of the creating org vdc network task
-                    self._checkTaskStatus(taskUrl=taskUrl)
-                    logger.debug('Updating external network sub allocated ip pool {}'.format(networkName))
-                    # save source extenal network metadata in target org vdc
-                    networkMetadata.remove(network)
-                    self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={"sourceExternalNetwork": networkMetadata})
-                else:
-                    errorDict = apiResponse.json()
-                    raise Exception("Failed to update source external network '{}': {}".format(
-                            networkName, errorDict['message']))
+                self._updateExternalNetworkPools(networkName, removeSourcePools, 'sub allocated ip pools (cleanup)')
+                logger.debug('Updating external network sub allocated ip pool {}'.format(networkName))
+                # save source extenal network metadata in target org vdc
+                networkMetadata.remove(network)
+                self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={"sourceExternalNetwork": networkMetadata})
         except Exception:
             raise
         finally:
@@ -6112,74 +6161,49 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                                 "Provider Gateway IP Space uplink - '{}' updated successfully with sub allocated ip pools.".format(
                                     ipSpace['name']))
                 else:
-                    for targetExtNetSubnet in targetExtNetData['subnets']['values']:
-                        targetExtNetSubnetAddress = ipaddress.ip_network(
-                            '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
-
-                        #  Continue if source edge gateway has no IP from the specific subnet
-                        if not sourceEgwSubnets.get(targetExtNetSubnetAddress):
-                            continue
-
-                        # Raise exception if target ext network subnet has not any free IP and EmptyPoolOverride flag is False
-
-                        if targetExtNetSubnet["totalIpCount"] == len(sourceEgwSubnets.get(targetExtNetSubnetAddress)):
-                            if self.orgVdcInput.get("EmptyIPPoolOverride", False):
+                    # PATCH-18: locked, verified read-change-write (other migrations may update the same network)
+                    def removePools(payload, sourceEgwSubnets=sourceEgwSubnets):
+                        wantAbsent = set()
+                        for targetExtNetSubnet in payload['subnets']['values']:
+                            targetExtNetSubnetAddress = ipaddress.ip_network(
+                                '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']), strict=False)
+                            #  Continue if source edge gateway has no IP from the specific subnet
+                            if not sourceEgwSubnets.get(targetExtNetSubnetAddress):
                                 continue
-                            else:
-                                raise Exception("External Network subnet should have atleast one free IP address which cannot be removed."
-                                                " EmptyPoolOverride flag must be set to true to perform successfull rollback/cleanup")
-
-                        # creating range of target external network pool range
-                        targetExtNetIpRange = set()
-                        for externalRange in (targetExtNetSubnet.get('ipRanges') or {}).get('values') or []:  # PATCH-1
-                            targetExtNetIpRange.update(self.createIpRange(
-                                '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']),
-                                externalRange['startAddress'], externalRange['endAddress']
-                            ))
-                        targetExtNetIpRange = set(targetExtNetIpRange)
-
-                        # creating range of source edge gateway ip range
-                        sourceEdgeGatewaySubIpRange = set()
-                        for ipRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
-                            sourceEdgeGatewaySubIpRange.update(self.createIpRange(
-                                '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']),
-                                ipRange['startAddress'], ipRange['endAddress']
-                            ))
-
-                        # removing the source edge gateway's static ips from target external ip list
-                        targetExtNetIpRange = targetExtNetIpRange.difference(sourceEdgeGatewaySubIpRange)
-
-                        # creating the range of each single ip in target external network's ips
-                        if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):  # PATCH-1
-                            targetExtNetSubnet['ipRanges'] = {}
-                        targetExtNetSubnet['ipRanges']['values'] = self.createExternalNetworkSubPoolRangePayload(
-                            targetExtNetIpRange)
-
-                    payloadData = json.dumps(targetExtNetData)
-
-                    # url to update the target external networks
-                    url = "{}{}/{}".format(vcdConstants.OPEN_API_URL.format(self.ipAddress),
-                                           vcdConstants.ALL_EXTERNAL_NETWORKS,
-                                           targetExtNetData['id'])
-
-                    # setting the content type to json
-                    self.headers["Content-Type"] = vcdConstants.OPEN_API_CONTENT_TYPE
-
-                    # put api call to update the target external networks
-                    apiResponse = self.restClientObj.put(url, self.headers, data=payloadData)
-                    if apiResponse.status_code == requests.codes.accepted:
-                        taskUrl = apiResponse.headers['Location']
-                        self._checkTaskStatus(taskUrl=taskUrl)
-                        logger.debug("Successfully reset the target external network '{}' to its initial state".format(
-                            targetExtNetData['name']))
-                    else:
-                        errorDict = apiResponse.json()
-                        msg = "Failed to update External network {} with sub allocated ip pools - {}".format(
-                            targetExtNetData['name'], errorDict['message'])
-                        if "provided list 'ipRanges.values' should have at least one" in errorDict.get("message", ""):
-                            msg += " Add one extra IP address to static pool of external network - {}".format(
-                                targetExtNetData['name'])
-                        raise Exception(msg)
+                            # Raise exception if target ext network subnet has not any free IP and EmptyPoolOverride flag is False
+                            if targetExtNetSubnet["totalIpCount"] == len(sourceEgwSubnets.get(targetExtNetSubnetAddress)):
+                                if self.orgVdcInput.get("EmptyIPPoolOverride", False):
+                                    continue
+                                else:
+                                    raise Exception("External Network subnet should have atleast one free IP address which cannot be removed."
+                                                    " EmptyPoolOverride flag must be set to true to perform successfull rollback/cleanup")
+                            # creating range of target external network pool range
+                            targetExtNetIpRange = set()
+                            for externalRange in (targetExtNetSubnet.get('ipRanges') or {}).get('values') or []:  # PATCH-1
+                                targetExtNetIpRange.update(self.createIpRange(
+                                    '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']),
+                                    externalRange['startAddress'], externalRange['endAddress']
+                                ))
+                            # creating range of source edge gateway ip range
+                            sourceEdgeGatewaySubIpRange = set()
+                            for ipRange in sourceEgwSubnets.get(targetExtNetSubnetAddress, []):
+                                sourceEdgeGatewaySubIpRange.update(self.createIpRange(
+                                    '{}/{}'.format(targetExtNetSubnet['gateway'], targetExtNetSubnet['prefixLength']),
+                                    ipRange['startAddress'], ipRange['endAddress']
+                                ))
+                            wantAbsent.update((str(targetExtNetSubnetAddress), int(ipaddress.ip_address(ip)))
+                                              for ip in sourceEdgeGatewaySubIpRange)
+                            # removing the source edge gateway's static ips from target external ip list
+                            targetExtNetIpRange = targetExtNetIpRange.difference(sourceEdgeGatewaySubIpRange)
+                            # creating the range of each single ip in target external network's ips
+                            if not isinstance(targetExtNetSubnet.get('ipRanges'), dict):  # PATCH-1
+                                targetExtNetSubnet['ipRanges'] = {}
+                            targetExtNetSubnet['ipRanges']['values'] = self.createExternalNetworkSubPoolRangePayload(
+                                targetExtNetIpRange)
+                        return set(), wantAbsent
+                    self._updateExternalNetworkPools(targetExtNetName, removePools, 'sub allocated ip pools (rollback)')
+                    logger.debug("Successfully reset the target external network '{}' to its initial state".format(
+                        targetExtNetName))
 
         except Exception:
             raise
@@ -6423,11 +6447,18 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
     # PATCH-11: catalog moves before cleanup ---------------------------------------------------------------
     def _recordCatalogMove(self, srcHref, srcName, srcDescription, dstId, dstName, created):
         moves = self.rollback.apiData.get('catalogMoves') or []
-        if not any(move['dstId'] == dstId for move in moves):
+        existing = next((move for move in moves if move['dstId'] == dstId), None)
+        if existing is not None and 'items' not in existing:
+            # PATCH-18: a record of the earlier format does not list the items it moved; continuing would record only
+            # the items moved from now on and hide the earlier ones from rollback
+            raise Exception("PATCH-11: the move record of catalog '{}' does not list the items moved so far (earlier record "
+                            "format) - reconcile it manually before moving more items".format(dstName))
+        if existing is None:
             moves.append({'srcHref': srcHref, 'srcName': srcName, 'srcDescription': srcDescription,
                           'dstId': dstId, 'dstName': dstName, 'created': created, 'items': []})
             self._saveCatalogMoves(moves)
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def _catalogItemEntity(self, catalogItemHref):
         """PATCH-11: href of the vApp template or media behind a catalog item (stable across moves and renames);
         None when VCD confirms the item does not exist."""
@@ -6441,6 +6472,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             raise Exception("PATCH-11: catalog item {} has no entity reference".format(catalogItemHref))
         return entity['@href']
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def _moveCatalogItemRecorded(self, catalogItem, catalogId, timeout):
         """PATCH-11 (--movecatalog): moves one item and records it by its entity (vApp template/media), so rollback
         moves back exactly these items, also when they were renamed. The item is recorded before the move."""
@@ -6448,7 +6480,11 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         move = next((m for m in moves if m['dstId'] == catalogId), None)
         if move is None:
             raise Exception("PATCH-11: no catalog move record for catalog {}".format(catalogId))
-        items = move.setdefault('items', [])
+        if 'items' not in move:
+            # PATCH-18: never create an item list for a record that did not have one
+            raise Exception("PATCH-11: the move record of catalog '{}' does not list the items moved so far (earlier record "
+                            "format) - reconcile it manually before moving more items".format(move['dstName']))
+        items = move['items']
         entity = self._catalogItemEntity(catalogItem['catalogItemHref'])
         if entity is None:
             raise Exception("PATCH-11: catalog item {} not found".format(catalogItem['catalogItemName']))
@@ -6470,6 +6506,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         if target and targetOrgVDCId:
             self.createMetaDataInOrgVDC(targetOrgVDCId, metadataDict={'catalogMoves': moves})
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def _catalogItems(self, catalogHref):
         response = self.restClientObj.get(catalogHref, headers=self.headers)
         if response.status_code != requests.codes.ok:
@@ -6497,10 +6534,12 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
         logger.info("Catalog items moved for {} catalog(s): {}".format(
             len(moves), ', '.join("{} -> {}".format(m['srcName'], m['dstName']) for m in moves) or 'none'))
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def _catalogEntities(self, catalogHref):
         """PATCH-11: {entity href: catalog item} of a catalog."""
         return {self._catalogItemEntity(item['@href']): item for item in self._catalogItems(catalogHref)}
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def rollbackCatalogMoves(self, timeout=7200):
         """
         PATCH-11: rollback of --movecatalog - moves the items this tool moved (recorded by entity) back to their
@@ -6558,6 +6597,7 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
             self._saveCatalogMoves(moves, target=False)
         logger.info("RollBack: catalog items are back in the source catalogs")
 
+    @isSessionExpired  # PATCH-18: the session is refreshed before these catalog reads
     def finalizeCatalogMoves(self):
         """
         PATCH-11: cleanup for --movecatalog pairs that cleanup's catalog migration did not finish itself
@@ -6595,6 +6635,10 @@ class VCloudDirectorOperations(ConfigureEdgeGatewayServices):
                             moves.remove(move)
                             checkpoint()
                             continue
+                        # PATCH-18: the deletion is recorded before it is made; a restart finds the source gone (404)
+                        # and continues with the rename
+                        move['state'] = 'deleting-source'
+                        checkpoint()
                         self.deleteSourceCatalog(move['srcHref'], {'@name': move['srcName']})
                     elif srcResponse.status_code != requests.codes.not_found:
                         raise Exception("PATCH-11: failed to read source catalog '{}' (HTTP {})".format(
