@@ -303,12 +303,6 @@ tar -czf vcdNSXMigrator-v1.5.9-linux.tar.gz -C dist vcdNSXMigrator
 
 `openssl` must be available on the PATH of the machine running the tool.
 
----
-
-### Offline tests
-
-The `tests` folder holds offline tests with mocked VCD, NSX-T and NSX-V APIs for the community patches. From the repository root, with the packages of `src/requirements-windows.txt` installed (on Linux the same list works; `pycryptodome` provides the `Crypto` module): `python -m unittest discover -s tests`. They need no access to any environment and do not replace a test migration and rollback in a lab.
-
 ## Security notes
 
 - On Windows, password files created by v1.5.1 or later can only be decrypted by the same Windows user on the same machine (DPAPI). Copy them elsewhere and they are useless; they are not portable between machines either – create a new one on each migration client. Files from builds before v1.5.1 still work but are not protected: delete them and let the current build create new ones.
